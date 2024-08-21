@@ -90,6 +90,22 @@ struct Copy_Traits<SM75_U32x4_LDSM_N>
 };
 
 template <>
+struct Copy_Traits<SM75_U32x4_LDSM_N_E4M3_V1>
+{
+  // Logical thread id to thread idx (warp)
+  using ThrID = Layout<_32>;
+
+  // Map from (src-thr,src-val) to bit
+  using SrcLayout = Layout<Shape < _32,_128>,
+                           Stride<_128,  _1>>;
+  // Map from (dst-thr,dst-val) to bit
+  using DstLayout = Layout<Shape <_32,Shape <_32,   _4>>,
+                           Stride<_32,Stride< _1,_1024>>>;
+
+  // Reference map from (thr,val) to bit
+  using RefLayout = DstLayout;
+};
+template <>
 struct Copy_Traits<SM75_U16x2_LDSM_T>
 {
   // Logical thread id to thread idx (warp)

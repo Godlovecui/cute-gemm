@@ -276,6 +276,22 @@ struct MMA_Traits<SM80_16x8x32_S32S8S8S32_TN>
                          Stride<Stride<_32,_1>, Stride<_8,_128>>>;
   using CLayout = SM80_16x8_Row;
 };
+template <>
+struct MMA_Traits<SM80_16x8x32_F32E4M3E4M3F32_TN>
+{
+  using ValTypeD = int32_t;
+  using ValTypeA = int8_t;
+  using ValTypeB = int8_t;
+  using ValTypeC = int32_t;
+
+  using Shape_MNK = Shape<_16,_8,_32>;
+  using ThrID   = Layout<_32>;
+  using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _4,_2,  _2>>,
+                         Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>;
+  using BLayout = Layout<Shape <Shape < _4,_8>, Shape <_4,  _2>>,
+                         Stride<Stride<_32,_1>, Stride<_8,_128>>>;
+  using CLayout = SM80_16x8_Row;
+};
 
 template <>
 struct MMA_Traits<SM80_16x8x32_S32S8S8S32_TN_SATURATE>

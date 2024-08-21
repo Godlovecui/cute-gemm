@@ -118,7 +118,35 @@ struct SM80_16x8x16_F16F16F16F16_TN
 #endif
   }
 };
+struct SM80_16x8x32_F32E4M3E4M3F32_TN
+{
+  using DRegisters = uint32_t[4];
+  using ARegisters = uint32_t[4];
+  using BRegisters = uint32_t[2];
+  using CRegisters = uint32_t[4];
 
+  CUTE_HOST_DEVICE static void
+  fma(uint32_t      & d0, uint32_t      & d1, uint32_t      & d2, uint32_t      & d3,
+      uint32_t const& a0, uint32_t const& a1, uint32_t const& a2, uint32_t const& a3,
+      uint32_t const& b0, uint32_t const& b1,
+      uint32_t const& c0, uint32_t const& c1, uint32_t const& c2, uint32_t const& c3)
+  {
+#if defined(CUTE_ARCH_MMA_SM80_ENABLED)
+    asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,  %1  %2  %3},"
+      "{%4,  %5,  %6,  %7},"
+      "{%8,  %9},"
+      "{%10,  %11,  %12,  %13};\n"
+      : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+      :  "r"(a0),  "r"(a1),  "r"(a2),  "r"(a3),
+         "r"(b0),  "r"(b1),
+         "r"(c0),  "r"(c1),  "r"(c2),  "r"(c3));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM80_16x8x32_F32E4M3E4M3F32_TN without CUTE_ARCH_MMA_SM80_ENABLED");
+#endif
+  }
+};
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // MMA 16x8x8 TN

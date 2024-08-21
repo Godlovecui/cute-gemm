@@ -123,6 +123,25 @@ struct SM75_U32x4_LDSM_N
   }
 };
 
+struct SM75_U32x4_LDSM_N_E4M3_V1
+{
+  using SRegisters = uint128_t[1];
+  using DRegisters = uint32_t[1];
+
+  CUTE_HOST_DEVICE static void
+  copy(uint128_t const& smem_src,
+       uint32_t& dst0, uint32_t& dst1, uint32_t& dst2, uint32_t& dst3)
+  {
+#if defined(CUTE_ARCH_LDSM_SM75_ACTIVATED)
+    uint32_t smem_int_ptr = cast_smem_ptr_to_uint(&smem_src);
+    asm volatile ("ldmatrix.sync.aligned.x4.m8n8.shared.e4m3 {%0, %1, %2, %3}, [%4];\n"
+        : "=r"(dst0), "=r"(dst1), "=r"(dst2), "=r"(dst3)
+        :  "r"(smem_int_ptr));
+#else
+    CUTE_INVALID_CONTROL_PATH("Trying to use ldmatrix without SM75_U32x4_LDSM_N_E4M3_V1.");
+#endif
+  }
+};
 struct SM75_U16x2_LDSM_T
 {
   using SRegisters = uint128_t[1];
@@ -204,6 +223,7 @@ copy_ldsm(uint128_t const* const smem_ptr,
   }
   else if (sizeof(T) == 16) {
     SM75_U32x4_LDSM_N::copy(smem_ptr[0], reg_ptr[0], reg_ptr[1], reg_ptr[2], reg_ptr[3]);
+    // SM75_U32x4_LDSM_N_E4M3_V1::copy(smem_ptr[0], reg_ptr[0], reg_ptr[1], reg_ptr[2], reg_ptr[3]);
   }
   else {
     static_assert(sizeof(T) == 4 || sizeof(T) == 8 || sizeof(T) == 16, "sizeof(T) is not supported");
