@@ -30,9 +30,9 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cute/config.hpp>
-#include <cute/util/type_traits.hpp>
 #include <cutlass/complex.h>
+#include <cute/util/type_traits.hpp>
+#include <cute/numeric/numeric_types.hpp>
 
 namespace cute
 {
@@ -44,28 +44,31 @@ using cutlass::real;
 using cutlass::imag;
 using cutlass::conj;
 
-/// Fused multiply-add for complex numbers
 template <class T>
+static constexpr auto is_complex_v = is_complex<T>::value;
+
+/// Fused multiply-add for complex numbers
+template <class D, class A, class B, class C>
 CUTE_HOST_DEVICE constexpr
 void
-fma(complex<T>      & d,
-    complex<T> const& a,
-    complex<T> const& b,
-    complex<T> const& c)
+fma(complex<D>      & d,
+    complex<A> const& a,
+    complex<B> const& b,
+    complex<C> const& c)
 {
-  d.real(fma( a.real(), b.real(), c.real()));
-  d.imag(fma( a.real(), b.imag(), c.imag()));
-  d.real(fma(-a.imag(), b.imag(), d.real()));
-  d.imag(fma( a.imag(), b.real(), d.imag()));
+  fma(d.real(),  a.real(), b.real(), c.real());
+  fma(d.imag(),  a.real(), b.imag(), c.imag());
+  fma(d.real(), -a.imag(), b.imag(), d.real());
+  fma(d.imag(),  a.imag(), b.real(), d.imag());
 }
 
 /// Fused multiply-add for triplets
-template <class T>
+template <class A, class B, class C>
 CUTE_HOST_DEVICE constexpr
 void
-fma(complex<T> const& a,
-    complex<T> const& b,
-    complex<T>      & c)
+fma(complex<A> const& a,
+    complex<B> const& b,
+    complex<C>      & c)
 {
   return fma(c, a, b, c);
 }

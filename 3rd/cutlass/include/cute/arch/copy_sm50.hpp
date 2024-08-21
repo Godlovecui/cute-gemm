@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -32,27 +32,41 @@
 
 #include <cute/config.hpp>
 
-#include <cute/layout.hpp>
+#include <cute/arch/copy.hpp>
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 500
+  #define CUTE_ARCH_WARP_SHUFFLE_ENABLED 1
+#endif
 
 namespace cute
 {
 
-//
-// A Tile is not a Layout, it's a tuple of Layouts or Tiles or Underscores
-//
-
-template <class... Layouts>
-using Tile = tuple<Layouts...>;
-
-template <class Tile>
-using is_tile = is_tuple<Tile>;
-
-template <class... Layouts>
-CUTE_HOST_DEVICE constexpr
-auto
-make_tile(Layouts const&... layouts)
+struct SM50_Shuffle_U32_2x2Trans
 {
-  return Tile<Layouts...>(layouts...);
-}
+  using SRegisters = uint32_t[2];
+  using DRegisters = uint32_t[2];
+
+  CUTE_HOST_DEVICE static void
+  copy(uint32_t const& src0, uint32_t const& src1, uint32_t& dst0, uint32_t& dst1)
+  {
+#if defined(CUTE_ARCH_WARP_SHUFFLE_ENABLED)
+    uint32_t x0 = src0;
+    uint32_t y0 = __shfl_xor_sync(0xffffffff, x0, 1);
+
+    uint32_t x1 = src1;
+    uint32_t y1 = __shfl_xor_sync(0xffffffff, x1, 1);
+
+    if (threadIdx.x % 2 == 0) {
+      dst1 = y0;
+    } 
+    else {
+      dst0 = y1;
+    }
+#else 
+    CUTE_INVALID_CONTROL_PATH("Trying to use __shfl_xor_sync without CUTE_ARCH_WARP_SHUFFLE_ENABLED.");
+#endif
+  }
+};
+
 
 } // end namespace cute

@@ -106,6 +106,56 @@ struct DefaultConvEpilogue<
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
+template <
+  typename ArchTag,
+  typename Shape,
+  typename WarpMmaSimt,
+  typename ElementOutput,
+  typename ElementTensor,
+  typename ElementVector,
+  typename OutputOp,
+  int ElementsPerAccess,
+  typename PermuteDLayout = layout::NoPermute,
+  conv::StrideSupport StrideSupport = conv::StrideSupport::kUnity,
+  int Rank = 4
+>
+struct DefaultConvEpilogueWithBroadcastSimt {
+  using Epilogue = typename epilogue::threadblock::DefaultEpilogueWithBroadcastSimt<
+    Shape,
+    WarpMmaSimt,
+    ElementOutput,
+    ElementTensor,
+    ElementVector,
+    OutputOp,
+    ElementsPerAccess,
+    false,
+    PermuteDLayout,
+    StrideSupport,
+    Rank
+  >::Epilogue;
+};
+
+template <
+  typename ArchTag,
+  typename Shape,
+  typename WarpMmaSimt,
+  typename ElementOutput,
+  typename ElementTensor,
+  typename ElementVector,
+  typename OutputOp,
+  int ElementsPerAccess
+>
+struct DefaultConvEpilogueWithBroadcastSimtStridedDgrad {
+  using Epilogue = typename epilogue::threadblock::DefaultEpilogueWithBroadcastSimtStridedDgrad<
+    Shape,
+    WarpMmaSimt,
+    ElementOutput,
+    ElementTensor,
+    ElementVector,
+    OutputOp,
+    ElementsPerAccess
+  >::Epilogue;
+};
 
 template <
   typename ArchTag,

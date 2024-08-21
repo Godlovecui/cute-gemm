@@ -69,7 +69,6 @@ public:
   using ProblemShape = ProblemShape_;
   static_assert(cute::rank(ProblemShape{}) == 3 or cute::rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
-
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
   using TileShape = typename CollectiveMainloop::TileShape;
@@ -146,12 +145,12 @@ public:
 
   // Kernel entry point API
   struct Params {
-    GemmUniversalMode mode;
-    ProblemShape problem_shape;
-    MainloopParams mainloop;
-    EpilogueParams epilogue;
-    KernelHardwareInfo hw_info;
-    TileSchedulerParams scheduler;
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerParams scheduler{};
   };
 
   //
@@ -165,7 +164,7 @@ public:
     CUTLASS_TRACE_HOST("to_underlying_arguments():");
 
     auto problem_shape = args.problem_shape;
-    if constexpr (detail::IF_SWAP_AB<CollectiveMainloop>::value) {
+    if constexpr (detail::Has_SwapAB_v<CollectiveMainloop>) {
       // swap M/N
       get<0>(problem_shape) = get<1>(args.problem_shape);
       get<1>(problem_shape) = get<0>(args.problem_shape);
@@ -196,8 +195,7 @@ public:
     };
   }
 
-  CUTLASS_HOST_DEVICE static
-  bool
+  static bool
   can_implement(Arguments const& args) {
     bool implementable = (args.mode == GemmUniversalMode::kGemm) or
         (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);
@@ -213,7 +211,7 @@ public:
   }
 
   static
-  int
+  size_t
   get_workspace_size(Arguments const& args) {
     TileScheduler t;
     return t.template get_workspace_size<ProblemShape, ElementAccumulator>(
@@ -222,10 +220,11 @@ public:
 
   static
   cutlass::Status
-  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr,
+    CudaHostAdapter* cuda_adapter = nullptr) {
     TileScheduler t;
     return t.template initialize_workspace<ProblemShape, ElementAccumulator>(
-      args.scheduler, workspace, stream, args.problem_shape, args.hw_info, NumMmaWarpGroups);
+      args.scheduler, workspace, stream, args.problem_shape, args.hw_info, NumMmaWarpGroups, 1, cuda_adapter);
   }
 
   // Computes the kernel launch grid shape based on runtime parameters
@@ -340,7 +339,7 @@ public:
     Tensor gB_nkl = local_tile(mB_nkl, blk_shape, make_coord(_,_,_), Step< X,_1,_1>{});          // (BLK_N,BLK_K,n,k,l)
 
     TileScheduler scheduler{params.scheduler};
-    auto work_tile_info = scheduler.get_current_work();
+    auto work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
 
     // In a warp specialized kernel, collectives expose data movement and compute operations separately
     CollectiveMainloop collective_mainloop;
@@ -402,7 +401,7 @@ public:
       }
 
         // Get next work tile
-        work_tile_info = fetch_next_work(work_tile_info, scheduler);
+        work_tile_info = scheduler.fetch_next_work(work_tile_info);
       } // Scheduler work fetch loop
 
       // Make sure all Consumer Warp Groups have been waited upon
@@ -478,7 +477,7 @@ public:
         }
 
         // Get next work tile
-        work_tile_info = fetch_next_work(work_tile_info, scheduler);
+        work_tile_info = scheduler.fetch_next_work(work_tile_info);
       } // Scheduler work fetch loop
 
       if (do_store_tail) {
@@ -493,24 +492,6 @@ public:
 #endif
   }
 
-private:
-  // Kernel helper function to get next work unit
-  CUTLASS_DEVICE
-  typename TileScheduler::WorkTileInfo
-  fetch_next_work(
-    typename TileScheduler::WorkTileInfo& work_tile_info,
-    TileScheduler& scheduler) const {
-    // Check whether we should continue on with the current work unit. If this is the case,
-    // the work unit will have been updated in continue_current_work to reflect the new
-    // tile to be computed.
-    if (scheduler.continue_current_work(work_tile_info)) {
-      return work_tile_info;
-    }
-
-    // Get next work tile
-    scheduler.advance_to_next_work();
-    return scheduler.get_current_work();
-  }
 };
 
 ///////////////////////////////////////////////////////////////////////////////

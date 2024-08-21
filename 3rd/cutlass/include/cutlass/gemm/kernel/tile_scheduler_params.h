@@ -35,16 +35,6 @@
     \brief Parameters structures for persistent tile schedulers
 */
 
-/*
-  Note:  CUTLASS 3x increases the host compiler requirements to C++17. However, certain
-         existing integrations of CUTLASS require C++11 host compilers.
-
-         Until this requirement can be lifted, certain headers with this annotation are required
-         to be remain consistent with C++11 syntax.
-
-         C++11 compatibility is enforced by this unit test: `cutlass_test_unit_core_cpp11`.
-*/
-
 #include "cutlass/coord.h"
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/workspace.h"
@@ -125,9 +115,9 @@ struct PersistentTileSchedulerSm90Params {
     int max_swizzle_size,
     RasterOrderOptions raster_order_option
   ) {
-    
+
     CUTLASS_UNUSED(hw_info);
-    
+
     // Round up to nearest multiple of swizzle_size along each mode
     auto log_swizzle_size = get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle_size);
     auto problem_blocks_m = round_up(problem_blocks.x, (1 << log_swizzle_size) * cluster_shape.m());
@@ -178,7 +168,8 @@ struct PersistentTileSchedulerSm90Params {
     KernelHardwareInfo hw_info,
     int max_swizzle_size,
     RasterOrderOptions raster_order_option,
-    bool truncate_by_problem_size=true) {
+    bool truncate_by_problem_size=true
+    ) {
 
     dim3 problem_blocks = get_tiled_cta_shape_mnl(problem_shape, cta_shape, cluster_shape);
     return get_grid_shape(
@@ -202,7 +193,8 @@ struct PersistentTileSchedulerSm90Params {
     KernelHardwareInfo hw_info,
     int max_swizzle_size,
     RasterOrderOptions raster_order_option,
-    bool truncate_by_problem_size=true) {
+    bool truncate_by_problem_size=true
+    ) {
 
     int const sm_count = hw_info.sm_count;
 
@@ -248,6 +240,7 @@ struct PersistentTileSchedulerSm90Params {
       }
     }
     else {
+      int cta_per_device = sm_count;
       /*
       * Optimal grid size calculation is based on
       * GH100: 8 GPCs, 72 TPCs (9 TPCs/GPC), 2 SMs/TPC, 144 SMs per full GPU
@@ -258,15 +251,16 @@ struct PersistentTileSchedulerSm90Params {
       auto cluster_size = cluster_shape.m() * cluster_shape.n();
       int const min_num_gpc = sm_count < max_sm_per_gpc ? 1 : sm_count / max_sm_per_gpc;
       int const max_cta_occupancy_per_gpc = max_sm_per_gpc - (max_sm_per_gpc % cluster_size);
-      int cta_per_device = min_num_gpc * max_cta_occupancy_per_gpc;
+      cta_per_device = min_num_gpc * max_cta_occupancy_per_gpc;
 
       // The calculation below allows for larger grid size launch for different GPUs.
       int const num_gpc_residual = sm_count < max_sm_per_gpc ? 0 : sm_count % max_sm_per_gpc;
       int const max_cta_occupancy_per_residual_gpc = num_gpc_residual - (num_gpc_residual % cluster_size);
       cta_per_device += max_cta_occupancy_per_residual_gpc;
 
-      cta_per_device = sm_count < cta_per_device ? sm_count : cta_per_device;
-
+      if (sm_count < cta_per_device) {
+        cta_per_device = sm_count;
+      }
       if (raster_order == RasterOrder::AlongN) {
         launch_grid.y = possibly_truncate(
             cta_per_device       / cluster_shape.m(),
@@ -430,7 +424,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
   // The splitting factor to be used in a split-K decomposition of the problem.
   // If this is set to a value greater than 1, stream-K decomposition logic
   // is bypassed in favor of a split-K decomposition.
-  uint32_t splits_ = 1;
+  FastDivmod divmod_splits_{};
 
   // Number of stream-K or split-K work units that compute an extra k iteration.
   // This is done to handle residuals in dividing up the k iteration space.
@@ -452,7 +446,10 @@ struct PersistentTileSchedulerSm90StreamKParams {
 
   // Number of tiled k iterations computed by each stream-K work unit. This
   // can potentially cover more than one output tile.
-  uint32_t k_tiles_per_sk_unit_ = 0;
+  FastDivmod divmod_k_tiles_per_sk_unit_{};
+  // Number of tiled k iterations computed by each "big" stream-K units, which
+  // processes one more K chunk than a "normal" stream-K unit.
+  FastDivmod divmod_k_tiles_per_sk_big_unit_{};
 
   // Strategy to use when reducing between collaborating CTAs
   ReductionMode reduction_mode_ = ReductionMode::Deterministic;
@@ -468,6 +465,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
 
   // Maximum number of groups of stream-K units
   static constexpr uint32_t max_sk_groups_ = 8u;
+
+  // ktile start from even for each cta
+  uint32_t ktile_start_alignment_count { 1u };
 
   // Divides dividend by the cluster size
   CUTLASS_HOST_DEVICE
@@ -595,6 +595,14 @@ struct PersistentTileSchedulerSm90StreamKParams {
         splits = k_tiles_per_output_tile;
       }
 
+      // If splits == k_tiles_per_output_tiles, there will be one k_tile per cta
+      //   and this violate k_tile start from even requirements. Thus we need to
+      //   reduce the number of splits.
+      if (ktile_start_alignment_count > 1u &&
+           static_cast<decltype(k_tiles_per_output_tile)>(splits) == k_tiles_per_output_tile) { 
+        splits = k_tiles_per_output_tile / ktile_start_alignment_count;
+      }
+
       set_params_basic(
         underlying_params,
         problem_blocks_m,
@@ -619,9 +627,15 @@ struct PersistentTileSchedulerSm90StreamKParams {
     );
 
     uint64_t ctas_per_wave = grid.x * grid.y;
-
+    auto cluster_size = cluster_shape.m() * cluster_shape.n();
     // The number of output tiles to be computed in stream-K and data-parallel fashion, respectively.
-    uint32_t sk_tiles = get_num_sk_tiles(output_tiles, ctas_per_wave, k_tiles_per_output_tile, decomposition_mode);
+    uint32_t sk_tiles = get_num_sk_tiles(
+      output_tiles,
+      ctas_per_wave,
+      cluster_size,
+      k_tiles_per_output_tile,
+      decomposition_mode
+    );
     uint64_t dp_tiles = output_tiles - sk_tiles;
 
     // Calculate the number of work units covering the data-parallel and stream-K tiles.
@@ -634,24 +648,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     // is needed per data-parallel tile.
     uint64_t dp_units = dp_tiles;
 
-    // Number of k iterations computed by the stream-K units as a whole
-    uint64_t k_tiles_sk_total = k_tiles_per_output_tile * sk_tiles;
-
-    // If there are stream-K tiles to compute and a sufficiently large number of k iterations
-    // across them, they will be covered by a single wave of persistent threadblocks. Thus, there
-    // will be as many work units as there are threadblocks in a single wave.
-    //
-    // When the total k iterations across stream-K tiles is too small to justify distributing
-    // across an entire wave of blocks, we instead distribute the iterations over a smaller
-    // set of blocks.
-
-    // Calculate the number of stream-K units that would be needed if each stream-K unit
-    // computed the minimum allowable k iterations. Truncate this to be in units of clusters.
-    auto cluster_size = cluster_shape.m() * cluster_shape.n();
-    uint64_t min_sized_sk_units = (k_tiles_sk_total / min_iters_per_sk_unit_);
-    min_sized_sk_units = (min_sized_sk_units / cluster_size) * cluster_size;
-
-    uint64_t sk_units = platform::min(ctas_per_wave, min_sized_sk_units);
+    uint64_t ctas_per_sk_wave = ctas_per_wave;
+    uint64_t sk_units = get_num_sk_units(cluster_shape, ctas_per_sk_wave, sk_tiles, k_tiles_per_output_tile);
 
     if (decomposition_mode == DecompositionMode::DataParallel ||
         (decomposition_mode == DecompositionMode::Heuristic && sk_tiles == 0) ||
@@ -706,7 +704,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     auto sk_splits_too_small = [&](uint32_t g) {
       // Check whether the number of K tiles computed per stream-K unit is less
       // than min_iters_per_sk_unit_
-      auto total_sk_k_tiles = (sk_tiles / g) * k_tiles_per_output_tile;
+      auto total_sk_cluster_tiles = (sk_cluster_tiles / g) * cluster_size;
+      auto total_sk_k_tiles = total_sk_cluster_tiles * k_tiles_per_output_tile;
       auto k_tiles_per_sk_unit = total_sk_k_tiles / (sk_units / g);
       return k_tiles_per_sk_unit < min_iters_per_sk_unit_;
     };
@@ -745,13 +744,12 @@ struct PersistentTileSchedulerSm90StreamKParams {
     //    sk_tiles = (waves <= 2) ? total_tiles : (sm_count + (total_tiles % sm_count))
     // Both total_tiles and sm_count are multiples of cluster size due to padding added
     // prior to kernel launch.
-    uint64_t sk_clustered_tiles = sk_tiles / cluster_size;
-    uint64_t sk_clustered_tiles_per_group = sk_clustered_tiles / groups;
-    uint64_t sk_tiles_per_group = sk_clustered_tiles_per_group * cluster_size;
+    uint64_t sk_cluster_tiles_per_group = sk_cluster_tiles / groups;
+    uint64_t sk_tiles_per_group = sk_cluster_tiles_per_group * cluster_size;
 
     // Groups that will process an extra stream-K tile cluster. These differ from "big_units," which
     // are stream-K units within a group that process an extra K chunk.
-    uint64_t sk_big_groups = sk_clustered_tiles % groups;
+    uint64_t sk_big_groups = sk_cluster_tiles % groups;
 
     uint64_t k_tiles_per_group = k_tiles_per_output_tile * sk_tiles_per_group;
 
@@ -797,7 +795,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     // This setting ensures that the use of this divmod for stream-K decompositions
     // is essentially a no-op.
     divmod_clusters_mnl_ = FastDivmodU64(sk_units / cluster_size);
-    splits_ = 1;
+    divmod_splits_ = FastDivmod(1);
     log_swizzle_size_ = underlying_params.log_swizzle_size_;
     units_per_problem_ = static_cast<uint32_t>(dp_units + sk_units);
     raster_order_ = underlying_params.raster_order_;
@@ -810,7 +808,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     reduction_workspace_ = reduction_workspace;
     sk_tiles_ = sk_tiles;
     sk_units_ = static_cast<uint32_t>(sk_units);
-    k_tiles_per_sk_unit_ = static_cast<uint32_t>(k_tiles_per_sk_unit);
+    divmod_k_tiles_per_sk_unit_ = FastDivmod(static_cast<uint32_t>(k_tiles_per_sk_unit));
+    divmod_k_tiles_per_sk_big_unit_ = FastDivmod(static_cast<uint32_t>(k_tiles_per_sk_unit + 1));
     reduction_mode_ = reduction_mode;
     divmod_epilogue_subtile_ = FastDivmodU64(epilogue_subtile);
     separate_reduction_units_ = reduction_units;
@@ -869,7 +868,13 @@ struct PersistentTileSchedulerSm90StreamKParams {
   // Returns the number of stream-K tiles that will be computed amongst `output_tiles` total
   // output tiles on a device with `ctas_per_wave` CTAs in each wave.
   static uint32_t
-  get_num_sk_tiles(uint64_t output_tiles, uint64_t ctas_per_wave, uint32_t k_tiles_per_output_tile, DecompositionMode decomposition_mode) {
+  get_num_sk_tiles(
+    uint64_t output_tiles,
+    uint64_t ctas_per_wave,
+    uint64_t cluster_size,
+    uint32_t k_tiles_per_output_tile,
+    DecompositionMode decomposition_mode
+  ) {
     uint32_t full_waves = static_cast<uint32_t>(output_tiles / ctas_per_wave);
     uint32_t total_waves = static_cast<uint32_t>((output_tiles + ctas_per_wave - 1) / ctas_per_wave);
 
@@ -877,6 +882,14 @@ struct PersistentTileSchedulerSm90StreamKParams {
         decomposition_mode == DecompositionMode::SplitK) {
       return 0;
     }
+
+    // If there is wave quantization, assign the first two waves worth of tiles to be
+    // covered by stream-K work and the remainder to be data-parallel. Since we know
+    // that full_waves == total_waves - 1 in this case, the number of data-parallel
+    // waves is simply full_waves-1 (unless full_waves == 0).
+    uint32_t dp_waves = full_waves > 1 ? full_waves - 1 : 0;
+    uint64_t dp_tiles = dp_waves * ctas_per_wave;
+    uint64_t sk_tiles = output_tiles - dp_tiles;
 
     if (decomposition_mode == DecompositionMode::Heuristic) {
       if (full_waves == total_waves || k_tiles_per_output_tile <= min_iters_per_sk_unit_) {
@@ -892,24 +905,28 @@ struct PersistentTileSchedulerSm90StreamKParams {
       // Rudimentary heuristic: prefer data-parallel decomposition if we have more than
       // one wave and the tail wave is more than half full. This is subject to change.
       uint64_t tail_tiles = output_tiles - (full_waves * ctas_per_wave);
-      if (tail_tiles >= (ctas_per_wave / 2)) {
+      if (2 * tail_tiles >= ctas_per_wave) {
         return 0;
       }
     }
 
-    // If there is wave quantization, assign the first two waves worth of tiles to be
-    // covered by stream-K work and the remainder to be data-parallel. Since we know
-    // that full_waves == total_waves - 1 in this case, the number of data-parallel
-    // waves is simply full_waves-1 (unless full_waves == 0).
-    uint32_t dp_waves = full_waves > 0 ? full_waves - 1 : 0;
-
-    uint64_t dp_tiles = dp_waves * ctas_per_wave;
-    return static_cast<uint32_t>(output_tiles - dp_tiles);
+    return static_cast<uint32_t>(sk_tiles);
   }
 
   CUTLASS_HOST_DEVICE
   static uint64_t
-  get_num_sk_units(GemmCoord cluster_shape, uint64_t ctas_per_wave, uint32_t sk_tiles, uint32_t k_tiles_per_output_tile) {
+  get_num_sk_units(GemmCoord cluster_shape, uint64_t ctas_per_sk_wave, uint32_t sk_tiles, uint32_t k_tiles_per_output_tile) {
+    // If there are stream-K tiles to compute and a sufficiently large number of k iterations
+    // across them, they will be covered by a single wave of persistent threadblocks. Thus, there
+    // will be as many work units as there are threadblocks in a single wave.
+    //
+    // When the total k iterations across stream-K tiles is too small to justify distributing
+    // across an entire wave of blocks, we instead distribute the iterations over a smaller
+    // set of blocks.
+
+    // Calculate the number of stream-K units that would be needed if each stream-K unit
+    // computed the minimum allowable k iterations. Truncate this to be in units of clusters.
+
     // Number of k iterations computed by the stream-K units as a whole
     uint64_t k_tiles_sk_total = k_tiles_per_output_tile * sk_tiles;
 
@@ -919,25 +936,25 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint64_t min_sized_sk_units = (k_tiles_sk_total / min_iters_per_sk_unit_);
     min_sized_sk_units = (min_sized_sk_units / cluster_size) * cluster_size;
 
-    uint64_t sk_units = platform::min(ctas_per_wave, min_sized_sk_units);
+    uint64_t sk_units = platform::min(ctas_per_sk_wave, min_sized_sk_units);
     return sk_units;
   }
 
   // Calculates the size of the workspace needed for holding reduction barriers
   CUTLASS_HOST_DEVICE
-  static int
+  static size_t
   get_barrier_workspace_size(uint64_t num_tiles, uint32_t mma_warp_groups, uint32_t barrier_bits) {
-    auto workspace_bits = num_tiles * mma_warp_groups * barrier_bits;
-    return round_up_to_l2_alignment(bits_to_bytes(static_cast<int>(workspace_bits)));
+    size_t workspace_bits = num_tiles * static_cast<size_t>(mma_warp_groups) * static_cast<size_t>(barrier_bits);
+    return round_up_to_l2_alignment(bits_to_bytes<size_t>(workspace_bits));
   }
 
   // Calculates the size of the workspace needed for holding partial outputs from splits
   CUTLASS_HOST_DEVICE
-  static int
-  get_reduction_workspace_size(uint64_t num_tiles, GemmCoord tile_shape, uint32_t accumulator_bits) {
-    auto output_tile_size = tile_shape.m() * tile_shape.n();
-    auto workspace_bits = accumulator_bits * output_tile_size * num_tiles;
-    return round_up_to_l2_alignment(bits_to_bytes(static_cast<int>(workspace_bits)));
+  static size_t
+  get_reduction_workspace_size(uint64_t num_tiles, GemmCoord tile_shape, uint32_t accumulator_bits, uint32_t num_accumulator_mtxs = 1) {
+    size_t output_tile_size = tile_shape.m() * tile_shape.n();
+    size_t workspace_bits = accumulator_bits * output_tile_size * num_tiles * num_accumulator_mtxs;
+    return round_up_to_l2_alignment(bits_to_bytes<size_t>(workspace_bits));
   }
 
   #if !defined(__CUDACC_RTC__)
@@ -947,8 +964,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t k_tiles_per_output_tile,
     GemmCoord tile_shape,
     GemmCoord cluster_shape,
-    int& barrier_workspace_size,
-    int& reduction_workspace_size,
+    size_t& barrier_workspace_size,
+    size_t& reduction_workspace_size,
     KernelHardwareInfo const& hw_info,
     int splits,
     int max_swizzle,
@@ -957,7 +974,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t mma_warp_groups,
     uint32_t barrier_bits,
     uint32_t accumulator_bits,
-    uint32_t epilogue_subtile = 1) {
+    uint32_t epilogue_subtile = 1,
+    uint32_t num_accumulator_mtxs = 1) {
 
     auto log_swizzle_size = UnderlyingParams::get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle);
     problem_blocks.x = round_up(problem_blocks.x, (1 << log_swizzle_size) * cluster_shape.m());
@@ -971,11 +989,11 @@ struct PersistentTileSchedulerSm90StreamKParams {
       barrier_workspace_size = 0;
       reduction_workspace_size = 0;
     }
-    else if (decomposition_mode == DecompositionMode::SplitK ||
-        (decomposition_mode == DecompositionMode::Heuristic && splits > 1)) {
+    else if (splits > 1 &&
+             (decomposition_mode == DecompositionMode::SplitK || decomposition_mode == DecompositionMode::Heuristic)) {
       // Basic split-K variant requires workspace for all output tiles
       barrier_workspace_size = get_barrier_workspace_size(output_tiles, mma_warp_groups, barrier_bits);
-      reduction_workspace_size = get_reduction_workspace_size(output_tiles, tile_shape, accumulator_bits);
+      reduction_workspace_size = get_reduction_workspace_size(output_tiles, tile_shape, accumulator_bits, num_accumulator_mtxs);
     }
     else {
       KernelHardwareInfo new_hw_info;
@@ -995,8 +1013,16 @@ struct PersistentTileSchedulerSm90StreamKParams {
         raster_order_option
       );
       uint64_t ctas_per_wave = grid.x * grid.y;
-      uint32_t sk_tiles = get_num_sk_tiles(output_tiles, ctas_per_wave, static_cast<uint32_t>(k_tiles_per_output_tile), decomposition_mode);
-      uint64_t sk_units = get_num_sk_units(cluster_shape, ctas_per_wave, sk_tiles, k_tiles_per_output_tile);
+      uint64_t cluster_size = cluster_shape.m() * cluster_shape.n();
+      uint32_t sk_tiles = get_num_sk_tiles(
+        output_tiles,
+        ctas_per_wave,
+        cluster_size,
+        static_cast<uint32_t>(k_tiles_per_output_tile),
+        decomposition_mode
+      );
+      uint64_t ctas_per_sk_wave = ctas_per_wave;
+      uint64_t sk_units = get_num_sk_units(cluster_shape, ctas_per_sk_wave, sk_tiles, k_tiles_per_output_tile);
       uint64_t dp_tiles = output_tiles - sk_tiles;
 
       uint64_t reduction_tiles = sk_tiles;
@@ -1012,7 +1038,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
       // written its accumulator to scratch space. The separate reduction unit will only begin
       // performing the reduction when the barrier has reached the number of peers for the output tile.
       barrier_workspace_size = get_barrier_workspace_size(sk_tiles, mma_warp_groups, barrier_bits);
-      reduction_workspace_size = get_reduction_workspace_size(reduction_tiles, tile_shape, accumulator_bits);
+      reduction_workspace_size = get_reduction_workspace_size(reduction_tiles, tile_shape, accumulator_bits, num_accumulator_mtxs);
     }
   }
   #endif // !defined(__CUDACC_RTC__)
@@ -1030,7 +1056,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
 
   // Get the amount of scratch workspace needed for the kernel. This variant of the method should only be used when
   // problem_shape and tile_shape contain modes of only rank 1.
-  static int
+  static size_t
   get_workspace_size(
     BatchedGemmCoord problem_shape,
     GemmCoord tile_shape,
@@ -1043,7 +1069,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t mma_warp_groups,
     uint32_t barrier_bits,
     uint32_t element_accumulator_bits,
-    uint32_t epilogue_subtile) {
+    uint32_t epilogue_subtile,
+    uint32_t num_accumulator_mtxs) {
 
     dim3 problem_blocks = UnderlyingParams::get_tiled_cta_shape_mnl(problem_shape, tile_shape, cluster_shape);
     uint32_t k_tiles_per_output_tile = (problem_shape.k() + tile_shape.k() - 1) / tile_shape.k();
@@ -1061,14 +1088,15 @@ struct PersistentTileSchedulerSm90StreamKParams {
       mma_warp_groups,
       barrier_bits,
       element_accumulator_bits,
-      epilogue_subtile
+      epilogue_subtile,
+      num_accumulator_mtxs
     );
   }
 
   // Version of get_workspace_size that takes in as input the number of CTAs in the M and N dimensions.
   // This is useful for calculating the tiled shape when a mode of problem and/or CTA shape has rank > 1,
   // for which using CuTe algebra for calculating tile shapes is easiest.
-  static int
+  static size_t
   get_workspace_size(
     dim3 problem_blocks,
     uint32_t k_tiles_per_output_tile,
@@ -1082,10 +1110,11 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t mma_warp_groups,
     uint32_t barrier_bits,
     uint32_t element_accumulator_bits,
-    uint32_t epilogue_subtile = 1) {
+    uint32_t epilogue_subtile = 1,
+    uint32_t num_accumulator_mtxs = 1) {
 
-    int barrier_workspace_size = 0;
-    int reduction_workspace_size = 0;
+    size_t barrier_workspace_size = 0;
+    size_t reduction_workspace_size = 0;
 
     #if !defined(__CUDACC_RTC__)
       get_workspace_component_sizes(
@@ -1103,7 +1132,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
         mma_warp_groups,
         barrier_bits,
         element_accumulator_bits,
-        epilogue_subtile
+        epilogue_subtile,
+        num_accumulator_mtxs
       );
     #endif
 
@@ -1127,7 +1157,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t mma_warp_groups,
     uint32_t barrier_bits,
     uint32_t element_accumulator_bits,
-    uint32_t epilogue_subtile) {
+    uint32_t epilogue_subtile,
+    CudaHostAdapter* cuda_adapter = nullptr) {
 
     dim3 problem_blocks = UnderlyingParams::get_tiled_cta_shape_mnl(problem_shape, tile_shape, cluster_shape);
     uint32_t k_tiles_per_output_tile = (problem_shape.k() + tile_shape.k() - 1) / tile_shape.k();
@@ -1147,7 +1178,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
       mma_warp_groups,
       barrier_bits,
       element_accumulator_bits,
-      epilogue_subtile
+      epilogue_subtile,
+      1,
+      cuda_adapter
     );
   }
 
@@ -1170,11 +1203,13 @@ struct PersistentTileSchedulerSm90StreamKParams {
     uint32_t mma_warp_groups,
     uint32_t barrier_bits,
     uint32_t element_accumulator_bits,
-    uint32_t epilogue_subtile = 1) {
+    uint32_t epilogue_subtile = 1,
+    uint32_t num_accumulator_mtxs = 1,
+    CudaHostAdapter* cuda_adapter = nullptr) {
 
     #if !defined(__CUDACC_RTC__)
-      int barrier_workspace_size = 0;
-      int reduction_workspace_size = 0;
+      uint64_t barrier_workspace_size = 0;
+      uint64_t reduction_workspace_size = 0;
 
       get_workspace_component_sizes(
         problem_blocks,
@@ -1191,7 +1226,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
         mma_warp_groups,
         barrier_bits,
         element_accumulator_bits,
-        epilogue_subtile
+        epilogue_subtile,
+        num_accumulator_mtxs
       );
 
       if (barrier_workspace_size > 0) {
@@ -1202,7 +1238,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
         // Only the barrier workspace needs to be cleared for stream-K.
         // Barrier workspace follows reduction workspace.
         uint8_t* barrier_workspace = reinterpret_cast<uint8_t*>(workspace) + reduction_workspace_size;
-        return zero_workspace(static_cast<void*>(barrier_workspace), barrier_workspace_size, stream);
+        return zero_workspace(static_cast<void*>(barrier_workspace), barrier_workspace_size, stream, cuda_adapter);
       }
     #endif // !defined(__CUDACC_RTC__)
 
@@ -1227,7 +1263,7 @@ struct PersistentTileSchedulerSm90StreamKParams {
     divmod_sk_groups_ = FastDivmodU64(1u);
     auto cluster_size = underlying_params.divmod_cluster_shape_major_.divisor * underlying_params.divmod_cluster_shape_minor_.divisor;
     divmod_clusters_mnl_ = FastDivmodU64((blocks_m * blocks_n * blocks_l) / cluster_size);
-    splits_ = splits;
+    divmod_splits_ = FastDivmod(splits);
     divmod_cluster_blk_major_ = underlying_params.divmod_cluster_blk_major_;
     log_swizzle_size_ = underlying_params.log_swizzle_size_;
     units_per_problem_ = blocks_m * blocks_n * blocks_l;
@@ -1235,7 +1271,8 @@ struct PersistentTileSchedulerSm90StreamKParams {
     big_units_ = k_tiles_per_output_tile % splits;
     reduction_workspace_ = reduction_workspace;
     reduction_mode_ = reduction_mode;
-    k_tiles_per_sk_unit_ = k_tiles_per_output_tile / splits;
+    divmod_k_tiles_per_sk_unit_ = FastDivmod(k_tiles_per_output_tile / splits);
+    divmod_k_tiles_per_sk_big_unit_ = FastDivmod(k_tiles_per_output_tile / splits + 1);
 
     // No stream-K work is performed for "basic" data-parallel and split-K decompositions
     sk_tiles_ = 0;
@@ -1247,9 +1284,9 @@ struct PersistentTileSchedulerSm90StreamKParams {
   private:
   // Round up number of bytes to the nearest multiple of L2 cache line alignment
   CUTLASS_HOST_DEVICE
-  static int
-  round_up_to_l2_alignment(int bytes) {
-    constexpr static uint32_t L2CacheLineSizeBytes = 128;
+  static size_t
+  round_up_to_l2_alignment(size_t bytes) {
+    constexpr size_t L2CacheLineSizeBytes = 128u;
     return (bytes + L2CacheLineSizeBytes - 1) / L2CacheLineSizeBytes * L2CacheLineSizeBytes;
   }
 };
@@ -1301,9 +1338,9 @@ struct PersistentTileSchedulerSm90GroupParams {
     int max_swizzle_size,
     RasterOrderOptions raster_order_option
   ) {
-    
+
     CUTLASS_UNUSED(hw_info);
-    
+
     // Round up to nearest multiple of swizzle_size along each mode
     auto log_swizzle_size = get_log_swizzle_size(problem_blocks.x, problem_blocks.y, max_swizzle_size);
     auto problem_blocks_m = round_up(problem_blocks.x, (1 << log_swizzle_size) * cluster_shape.m());

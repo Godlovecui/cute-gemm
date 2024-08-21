@@ -32,16 +32,6 @@
     \brief Utilities for initializing workspaces
 */
 
-/*
-  Note:  CUTLASS 3x increases the host compiler requirements to C++17. However, certain
-         existing integrations of CUTLASS require C++11 host compilers.
-
-         Until this requirement can be lifted, certain headers with this annotation are required
-         to be remain consistent with C++11 syntax.
-
-         C++11 compatibility is enforced by this unit test: `cutlass_test_unit_core_cpp11`.
-*/
-
 #pragma once
 
 #if !defined(__CUDACC_RTC__)
@@ -52,6 +42,7 @@
 #endif
 
 #include "cutlass.h"
+#include "cutlass/cuda_host_adapter.hpp"
 
 namespace cutlass {
 
@@ -61,7 +52,7 @@ static constexpr int MinWorkspaceAlignment = 16;
 
 #if !defined(__CUDACC_RTC__)
 static Status
-zero_workspace(void* workspace, size_t workspace_size, cudaStream_t stream = nullptr) {
+zero_workspace(void* workspace, size_t workspace_size, cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
   if (workspace_size > 0) {
     if (workspace == nullptr) {
       CUTLASS_TRACE_HOST("  error: device workspace must not be null");
@@ -69,12 +60,28 @@ zero_workspace(void* workspace, size_t workspace_size, cudaStream_t stream = nul
     }
 
     CUTLASS_TRACE_HOST("  clearing workspace");
+
+#if defined(CUTLASS_ENABLE_CUDA_HOST_ADAPTER) && CUTLASS_ENABLE_CUDA_HOST_ADAPTER
+    //
+    // Use the cuda host adapter
+    //
+    CUTLASS_ASSERT(cuda_adapter);
+    if (cuda_adapter) {
+      if (Status::kSuccess != cuda_adapter->memsetDevice(workspace, static_cast<uint8_t>(0), workspace_size, stream)) {
+        return Status::kErrorInternal;
+      }
+    }
+    else {
+      return Status::kErrorInternal;
+    }
+#else
     cudaError_t result = cudaMemsetAsync(workspace, 0, workspace_size, stream);
     if (cudaSuccess != result) {
       result = cudaGetLastError(); // to clear the error bit
       CUTLASS_TRACE_HOST("  cudaMemsetAsync() returned error " << cudaGetErrorString(result));
       return Status::kErrorInternal;
     }
+#endif
   }
 
   return Status::kSuccess;
@@ -84,7 +91,7 @@ zero_workspace(void* workspace, size_t workspace_size, cudaStream_t stream = nul
 #if !defined(__CUDACC_RTC__)
 template <typename T>
 Status
-fill_workspace(void* workspace, T fill_value, size_t fill_count, cudaStream_t stream = nullptr) {
+fill_workspace(void* workspace, T fill_value, size_t fill_count, cudaStream_t stream = nullptr, CudaHostAdapter *cuda_adapter = nullptr) {
   static_assert(sizeof(T) == 4 || sizeof(T) == 2 || sizeof(T) == 1, "Unsupported fill type");
   if (fill_count > 0) {
     if (workspace == nullptr) {
@@ -93,6 +100,21 @@ fill_workspace(void* workspace, T fill_value, size_t fill_count, cudaStream_t st
     }
 
     CUTLASS_TRACE_HOST("  filling workspace");
+
+#if defined(CUTLASS_ENABLE_CUDA_HOST_ADAPTER) && CUTLASS_ENABLE_CUDA_HOST_ADAPTER
+    //
+    // Use the cuda host adapter
+    //
+    CUTLASS_ASSERT(cuda_adapter);
+    if (cuda_adapter) {
+      if (Status::kSuccess != cuda_adapter->memsetDevice(workspace, fill_value, fill_count, stream)) {
+        return Status::kErrorInternal;
+      }
+    }
+    else {
+      return Status::kErrorInternal;
+    }
+#else
     CUdeviceptr d_workspace = reinterpret_cast<CUdeviceptr>(workspace);
     CUresult result = CUDA_SUCCESS;
     if (sizeof(T) == 4) {
@@ -116,6 +138,7 @@ fill_workspace(void* workspace, T fill_value, size_t fill_count, cudaStream_t st
       }
       return Status::kErrorInternal;
     }
+#endif
   }
 
   return Status::kSuccess;

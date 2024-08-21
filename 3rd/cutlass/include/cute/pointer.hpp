@@ -33,7 +33,7 @@
 #include <cute/config.hpp>
 
 #include <cute/util/type_traits.hpp>
-#include <cute/numeric/int.hpp>        // sizeof_bits
+#include <cute/numeric/numeric_types.hpp>        // sizeof_bits
 #include <cute/numeric/math.hpp>
 #include <cute/numeric/integral_constant.hpp>
 
@@ -41,7 +41,6 @@
 
 #include <cute/pointer_base.hpp>
 #include <cute/pointer_swizzle.hpp>
-#include <cute/layout.hpp>
 namespace cute
 {
 
@@ -58,7 +57,7 @@ CUTE_HOST_DEVICE constexpr
 auto
 recast_ptr(void* ptr)
 {
-  if constexpr (is_subbyte<NewT>::value) {
+  if constexpr (cute::is_subbyte_v<NewT>) {
     return subbyte_iterator<NewT>(ptr);
   } else {
     return reinterpret_cast<NewT*>(ptr);
@@ -71,7 +70,7 @@ CUTE_HOST_DEVICE constexpr
 auto
 recast_ptr(void const* ptr)
 {
-  if constexpr (is_subbyte<NewT>::value) {
+  if constexpr (cute::is_subbyte_v<NewT>) {
     return subbyte_iterator<NewT const>(ptr);
   } else {
     return reinterpret_cast<NewT const*>(ptr);
@@ -102,6 +101,8 @@ template <class P>                     // Found the gmem
 struct is_gmem<gmem_ptr<P>> : true_type {};
 template <class P>                     // Recurse on ::iterator, if possible
 struct is_gmem<P, void_t<typename P::iterator>> : is_gmem<typename P::iterator> {};
+template <class P>
+constexpr bool is_gmem_v = is_gmem<P>::value;
 
 // Idempotent gmem tag on an iterator
 template <class Iterator>
@@ -163,6 +164,8 @@ template <class P>                     // Found the smem
 struct is_smem<smem_ptr<P>> : true_type {};
 template <class P>                     // Recurse on ::iterator, if possible
 struct is_smem<P, void_t<typename P::iterator>> : is_smem<typename P::iterator> {};
+template <class P>
+constexpr bool is_smem_v = is_smem<P>::value;
 
 // Idempotent smem tag on an iterator
 template <class Iterator>
@@ -224,6 +227,8 @@ template <class T, class = void>
 struct is_rmem : bool_constant<not (is_gmem<T>::value || is_smem<T>::value)> {};
 template <class P>
 struct is_rmem<rmem_ptr<P>> : true_type {};
+template <class P>
+constexpr bool is_rmem_v = is_rmem<P>::value;
 
 // Idempotent rmem tag on an iterator
 template <class Iterator>

@@ -33,21 +33,17 @@
 
     This is inspired by the Standard Library's <functional> header.
 */
-/*
-  Note:  CUTLASS 3x increases the host compiler requirements to C++17. However, certain
-         existing integrations of CUTLASS require C++11 host compilers.
-
-         Until this requirement can be lifted, certain headers with this annotation are required
-         to be remain consistent with C++11 syntax.
-
-         C++11 compatibility is enforced by `cutlass_test_unit_core_cpp11`.
-*/
 #pragma once
 
 #include "cutlass/cutlass.h"
-#include "cutlass/half.h"
-#include "cutlass/tfloat32.h"
-#include "cutlass/bfloat16.h"
+#include "cutlass/numeric_types.h"
+#include "cutlass/platform/platform.h"
+
+#if defined(__CUDACC_RTC__)
+#include "cutlass/floating_point_nvrtc.h"
+#endif
+
+#include <cuda_runtime.h>
 
 #if defined(CUTLASS_ARCH_WMMA_ENABLED)
 #include <mma.h>
@@ -106,7 +102,7 @@ struct multiplies {
 template <typename T>
 struct scale {
   T const scaling_factor_;
-  
+
   CUTLASS_HOST_DEVICE
   scale(float scaling_factor) : scaling_factor_(scaling_factor) {
   }
@@ -218,6 +214,35 @@ struct magnitude_squared_difference {
   }
 };
 
+// Computes the reciprocal square root
+template <typename T>
+struct inverse_square_root;
+
+template <>
+struct inverse_square_root<float> {
+  CUTLASS_HOST_DEVICE
+  float operator()(float const &lhs) const {
+#if defined(__CUDA_ARCH__)
+    return rsqrtf(lhs);
+#else
+    return 1.f / std::sqrt(lhs);
+#endif
+  }
+};
+
+template <>
+struct inverse_square_root<half_t> {
+  CUTLASS_HOST_DEVICE
+  half_t operator()(half_t const &lhs) const {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ > 520
+    auto result = hrsqrt(reinterpret_cast<__half const &>(lhs));
+    return reinterpret_cast<half_t const &>(result);
+#else
+    return half_t(1.f / std::sqrt(half_t::convert(lhs)));
+#endif
+  }
+};
+
 /// Divides
 template <typename T>
 struct divides {
@@ -228,21 +253,50 @@ struct divides {
   }
 };
 
-/// reciprocal_approximate 
+/// reciprocal_approximate
 template <typename T>
 struct reciprocal_approximate {
   CUTLASS_HOST_DEVICE
   T operator()(T lhs) const {
-    return divide(T(1), lhs);
+    return divides<T>{}(T(1), lhs);
   }
 };
 
 template <>
 struct reciprocal_approximate <float> {
   CUTLASS_HOST_DEVICE
-  float operator()(float lhs) const { 
+  float operator()(float lhs) const {
     float ret;
+    #if defined(__CUDA_ARCH__)
+      asm volatile ("rcp.approx.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
+    #else
       ret = 1.0f / lhs;
+    #endif
+    return ret;
+  }
+};
+
+/// reciprocal_approximate with ftz
+template<typename T>
+struct reciprocal_approximate_ftz :  reciprocal_approximate<T>
+{};
+
+template <>
+struct reciprocal_approximate_ftz <float> {
+  CUTLASS_HOST_DEVICE
+  float operator()(float lhs) const {
+    float ret;
+    #if defined(__CUDA_ARCH__)
+      asm volatile ("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(ret) : "f"(lhs));
+    #else
+      if (std::fpclassify(lhs) == FP_SUBNORMAL) {
+        lhs = 0.0f;
+      }
+      ret = 1.0f / lhs;
+      if (std::fpclassify(ret) == FP_SUBNORMAL) {
+        ret = 0.0f;
+      }
+    #endif
     return ret;
   }
 };
@@ -256,7 +310,7 @@ struct negate {
   }
 };
 
-/// Greater equal 
+/// Greater equal
 template <typename T>
 struct greater_equal {
   CUTLASS_HOST_DEVICE
@@ -265,7 +319,7 @@ struct greater_equal {
   }
 };
 
-/// Greater  
+/// Greater
 template <typename T>
 struct greater {
   CUTLASS_HOST_DEVICE
@@ -274,7 +328,7 @@ struct greater {
   }
 };
 
-/// Less equal 
+/// Less equal
 template <typename T>
 struct less_equal {
   CUTLASS_HOST_DEVICE
@@ -283,7 +337,7 @@ struct less_equal {
   }
 };
 
-/// Less  
+/// Less
 template <typename T>
 struct less {
   CUTLASS_HOST_DEVICE
@@ -315,11 +369,14 @@ template <typename T>
 struct maximum<T, true> {
   CUTLASS_HOST_DEVICE
   T operator()(T const &lhs, T const &rhs) const {
-#if defined(__CUDA_ARCH__)
-    return lhs > rhs or isnan(lhs) ? lhs : rhs;
-#else
-    return lhs > rhs or std::isnan(lhs) ? lhs : rhs;
-#endif
+    using CUTLASS_CMATH_NAMESPACE :: isnan;
+
+    // Call isnan unqualified, so argument-dependent lookup (ADL)
+    // will find overloads such as cutlass::isnan(half_t).
+    // Calling ::isnan or std::isnan directly would force
+    // implicit conversions to float of custom number types
+    // in the cutlass namespace (e.g., cutlass::half_t).
+    return lhs > rhs || isnan(lhs) ? lhs : rhs;
   }
 };
 
@@ -335,15 +392,14 @@ template <>
 struct maximum<float, true> {
   CUTLASS_HOST_DEVICE
   float operator()(float const lhs, float const rhs) const {
-    float res;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    float res;
     asm volatile("max.NaN.f32 %0, %1, %2;\n" : "=f"(res) : "f"(lhs), "f"(rhs));
-#elif defined(__CUDA_ARCH__)
-    res = lhs > rhs or isnan(lhs) ? lhs : rhs;
-#else
-    res = lhs > rhs or std::isnan(lhs) ? lhs : rhs;
-#endif
     return res;
+#else
+    using CUTLASS_CMATH_NAMESPACE :: isnan;
+    return lhs > rhs || isnan(lhs) ? lhs : rhs;
+#endif
   }
 };
 
@@ -373,11 +429,9 @@ template <typename T>
 struct minimum<T, true> {
   CUTLASS_HOST_DEVICE
   T operator()(T const &lhs, T const &rhs) const {
-#if defined(__CUDA_ARCH__)
-    return lhs < rhs or isnan(lhs) ? lhs : rhs;
-#else
-    return lhs < rhs or std::isnan(lhs) ? lhs : rhs;
-#endif
+    using CUTLASS_CMATH_NAMESPACE :: isnan;
+
+    return lhs < rhs || isnan(lhs) ? lhs : rhs;
   }
 };
 
@@ -388,6 +442,10 @@ struct minimum<float, false> {
     return fminf(lhs, rhs);
   }
 };
+
+template <typename T>
+struct minimum_with_nan_propagation : minimum<T, true> 
+{};
 
 template <typename T, bool PropagateNaN = false>
 struct maximum_absolute_value {
@@ -421,6 +479,15 @@ struct multiply_add {
   }
 };
 
+template <typename T>
+struct square_and_plus {
+  CUTLASS_HOST_DEVICE
+  T operator()(T lhs, T const &rhs) const {
+    multiply_add<T> multiply_add_op;
+    return multiply_add_op(rhs, rhs, lhs);
+  }
+};
+
 // Fused multiply-add that takes exactly one template parameter.
 // This is useful for working around a known Clang issue,
 // where a template template parameter with one template parameter
@@ -437,6 +504,78 @@ struct multiply_add_relu0 {
   C operator()(A const &a, B const &b, C const &c) const {
     maximum<C> mx;
     return mx(C(a) * C(b) + c, C(0));
+  }
+};
+
+/// Guarded-multiply-add
+template <typename A, typename B = A, typename C = A>
+struct guarded_multiply_add {
+  CUTLASS_HOST_DEVICE
+  C operator()(A const &a, B const &b, C const &c) const {
+    using CUTLASS_CMATH_NAMESPACE :: isnan;
+
+    if (isnan(a) || isnan(b)) {
+      return C(0);
+    }
+    return C(a) * C(b) + c;
+  }
+};
+
+/// Guarded-multiply-add
+template <>
+struct guarded_multiply_add<half_t, half_t, half_t> {
+  CUTLASS_HOST_DEVICE
+  half_t operator()(half_t const &a, half_t const &b, half_t const &c) const {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    half_t result;
+    asm ("fma.rn.oob.f16 %0, %1, %2, %3;\n"
+      : "=h"(*reinterpret_cast<uint16_t*>(&result))
+      : "h"(*reinterpret_cast<uint16_t const*>(&a)), "h"(*reinterpret_cast<uint16_t const*>(&b)), "h"(*reinterpret_cast<uint16_t const*>(&c)));
+    return result;
+#else
+    // Namespace-qualifying isnan as cutlass::isnan saves the compiler
+    // the trouble of argument-dependent lookup.  Calling std::isnan or
+    // ::isnan here would result in unwanted implicit conversion to float.
+    if (cutlass::isnan(a) || cutlass::isnan(b)) {
+      return half_t(0);
+    }
+    return a * b + c;
+#endif
+  }
+};
+
+/// Guarded-multiply-add-relu0
+template <typename A, typename B = A, typename C = A>
+struct guarded_multiply_add_relu0 {
+  CUTLASS_HOST_DEVICE
+  C operator()(A const &a, B const &b, C const &c) const {
+    using CUTLASS_CMATH_NAMESPACE :: isnan;
+
+    if (isnan(a) || isnan(b)) {
+      return C(0);
+    }
+    maximum<C> mx;
+    return mx(C(a) * C(b) + c, C(0));
+  }
+};
+
+template <>
+struct guarded_multiply_add_relu0<half_t, half_t, half_t> {
+  CUTLASS_HOST_DEVICE
+  half_t operator()(half_t const &a, half_t const &b, half_t const &c) const {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    half_t result;
+    asm ("fma.rn.oob.relu.f16 %0, %1, %2, %3;\n"
+      : "=h"(*reinterpret_cast<uint16_t*>(&result))
+      : "h"(*reinterpret_cast<uint16_t const*>(&a)), "h"(*reinterpret_cast<uint16_t const*>(&b)), "h"(*reinterpret_cast<uint16_t const*>(&c)));
+    return result;
+#else
+    if (cutlass::isnan(a) || cutlass::isnan(b)) {
+      return half_t(0);
+    }
+    maximum<half_t> mx;
+    return mx(a * b + c, half_t(0));
+#endif
   }
 };
 
@@ -459,11 +598,99 @@ struct xor_add {
   }
 };
 
+namespace detail {
+
+// Whether namespace-unqualified conj(t) for t of type T is
+// well-formed.  This says whether the compiler can find
+// namespace-unqualified conj(T) via argument-dependent lookup.
+// If so, then CUTLASS assumes that conj(t) returns
+// the complex conjugate of t.
+template <typename T, typename Enable = void>
+struct has_unqualified_conj : cutlass::platform::false_type
+{};
+
+template<typename T>
+struct has_unqualified_conj<
+    T,
+    decltype(conj(cutlass::platform::declval<T>()), void())
+  > : cutlass::platform::true_type
+{};
+
+template <typename T>
+constexpr bool has_unqualified_conj_v = has_unqualified_conj<T>::value;
+  
+} // namespace detail
+
+// forward declaration (needed for conjugate below)
+template<class T>
+CUTLASS_HOST_DEVICE T conj(T const& z);
+
+namespace detail {
+
+// Whether cutlass::conj(t) for t of type T is well-formed.
+// If so, then CUTLASS assumes that cutlass::conj(t)
+// returns the complex conjugate of t.
+template <typename T, typename Enable = void>
+struct has_cutlass_conj : cutlass::platform::false_type
+{};
+
+template<typename T>
+struct has_cutlass_conj<
+    T,
+    decltype(cutlass::conj(cutlass::platform::declval<T>()), void())
+  > : cutlass::platform::true_type
+{};
+
+template <typename T>
+constexpr bool has_cutlass_conj_v = has_cutlass_conj<T>::value;
+
+} // namespace detail
+  
+// Return the complex conjugate of the input.
+//
+// If the struct hasn't already been specialized for type T, then
+//
+// 1. for arithmetic types, return z;
+//
+// 2. for types where either (namespace-unqualified) conj(z) or
+//    cutlass::conj(z) is well formed, declare "using cutlass::conj;"
+//    and return conj(z); and
+//
+// 3. for everything else, return z.
+//
+// Regarding (1), the C++ Standard Library makes std::conj always
+// return std::complex, even for (noncomplex) arithmetic types.
+// cutlass::conj(T t) needs to return type T.  This follows the
+// convention of linear algebra software like the BLAS, where
+// "conjugate transpose" means the same thing as "transpose" for a
+// matrix of noncomplex numbers.
+//
+// Case (2) covers std::complex, cuda::std::complex, and non-Standard
+// (including user-defined) complex number types (for which "conj(z)"
+// is findable via argument-dependent lookup).  cutlass::conj has a
+// totally generic overload, but a more type-specific overload in any
+// namespace will take precedence.
+//
+// Case (3) covers non-Standard non-complex number types.
+//
+// Users should not generally need to specialize this struct for their
+// own custom complex or noncomplex types.  The idiomatic way to
+// identify a type T as "complex" is to make namespace-unqualified
+// calls to conj(T) findable via argument-dependent lookup.
 template <typename T>
 struct conjugate {
   CUTLASS_HOST_DEVICE
-  T operator()(T const &a) const {
-    return a;
+  T operator()(T const& z) const {
+    if constexpr (cutlass::platform::is_arithmetic_v<T>) {
+      return z;
+    }
+    else if constexpr (detail::has_unqualified_conj_v<T> || detail::has_cutlass_conj_v<T>) {
+      using cutlass::conj;
+      return conj(z);
+    }
+    else {
+      return z;
+    }
   }
 };
 
@@ -471,6 +698,10 @@ template <typename T>
 struct first {
   CUTLASS_HOST_DEVICE
   T operator()(T const & first, T const &...) const {
+    return first;
+  }
+  CUTLASS_HOST_DEVICE
+  T operator()(T const & first) const {
     return first;
   }
 };
@@ -481,7 +712,7 @@ template <typename T>
 struct logical_and {
   CUTLASS_HOST_DEVICE
   T operator()(T const &a, T const &b) const {
-    return ((a && b) ? T(1) : T());
+    return ((static_cast<bool>(a) && static_cast<bool>(b)) ? T(1) : T());
   }
 };
 
@@ -489,7 +720,7 @@ template <typename T>
 struct logical_or {
   CUTLASS_HOST_DEVICE
   T operator()(T const &a, T const &b) const {
-    return ((a || b) ? T(1) : T());
+    return ((static_cast<bool>(a) || static_cast<bool>(b)) ? T(1) : T());
   }
 };
 
@@ -535,8 +766,6 @@ struct bit_xor {
   }
 };
 
-
-
 //////////////////////////////////////////////////////////////////////////////////////////////////
 /// Atomic reductions
 
@@ -548,6 +777,10 @@ struct atomic_add
   {
 #if defined(__CUDA_ARCH__)
     atomicAdd(ptr, data);
+#else
+    CUTLASS_UNUSED(ptr);
+    CUTLASS_UNUSED(data);
+    CUTLASS_NOT_IMPLEMENTED();
 #endif
   }
 };
@@ -559,8 +792,9 @@ struct atomic_add<double>
   void operator()(double *ptr, const double &data)
   {
 #if !defined(__CUDA_ARCH__)
-      CUTLASS_UNUSED(ptr);
-      CUTLASS_UNUSED(data);
+    CUTLASS_UNUSED(ptr);
+    CUTLASS_UNUSED(data);
+    CUTLASS_NOT_IMPLEMENTED();
 #elif (__CUDA_ARCH__ >= 600)
     atomicAdd(ptr, data);
 #else
@@ -585,8 +819,9 @@ struct atomic_add<half2>
   void operator()(half2 *ptr, const half2 &data)
   {
 #if !defined(__CUDA_ARCH__) || (defined(__CUDA_ARCH__)  && (__CUDA_ARCH__ < 600))
-      CUTLASS_UNUSED(ptr);
-      CUTLASS_UNUSED(data);
+    CUTLASS_UNUSED(ptr);
+    CUTLASS_UNUSED(data);
+    CUTLASS_NOT_IMPLEMENTED();
 #else
     // Vector-2 atomic reduction requires .target sm_60 or higher
     uint32_t word = reinterpret_cast<const uint32_t&>(data);
@@ -618,7 +853,13 @@ struct atomic_maximum<float> {
   CUTLASS_DEVICE
   float operator()(float *ptr, float value) const {
 #if defined(__CUDA_ARCH__)
-    return !signbit(value) ?
+    // In device code, make sure that we do NOT try to use
+    // std::signbit, as that won't work if building with NVRTC.
+    // Instead, prefix "::" to call signbit from the global namespace,
+    // which CUDA guarantees to work in device code without including
+    // any headers.
+    //
+    return ! ::signbit(value) ?
       __int_as_float(atomicMax((int*)ptr, __float_as_int(value))) :
       __uint_as_float(atomicMin((unsigned int*)ptr, __float_as_uint(value)));
 #else

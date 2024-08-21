@@ -36,10 +36,13 @@
 #include <cute/numeric/integer_sequence.hpp>
 
 #include <cute/container/cuda_types.hpp>
+#include <cute/container/type_list.hpp>
+#if defined(CUTLASS_USE_PACKED_TUPLE)
+#  include <cute/container/packed_tuple.hpp>
+#endif
 
 //#include <cute/container/array.hpp>            // Advanced optimizations
 
-//
 // cute::tuple is like std::tuple, with two differences.
 //
 // 1. It works on both host and device.
@@ -50,18 +53,29 @@
 // but do _not_ include references like int& or float&.
 // (See std::tie for an example of a tuple of references.)
 //
-// This is simplified over the implementations in std::, cuda::std::, and thrust:: by ignoring much of
-//    the conversion SFINAE, special overloading, and avoiding cvref template types.
-//    Furthermore, the empty base optimization (EBO) is MORE aggressive by avoiding
-//    construction calls, and ignoring any need for unique element addresses.
-//
-// Over standard-conforming tuple implementations, this appears to accelerate compilation times by over 3x.
+// If the template arguments of cute::tuple are all empty types (in
+// the sense of std::is_empty_v), then the cute::tuple is also an
+// empty type.  Furthermore, if CUTLASS_USE_PACKED_TUPLE is defined,
+// cute::tuple is always a standard-layout type if all of its template
+// arguments are standard-layout types.
 
 namespace cute
 {
 
+#if defined(CUTLASS_USE_PACKED_TUPLE)
+
+template<class... T>
+using tuple = packed_tuple<T...>;
+
+#else
+
 namespace detail
 {
+
+// This is simplified over the implementations in std::, cuda::std::, and thrust:: by ignoring much of
+// the conversion SFINAE, special overloading, and avoiding cvref template types.
+//
+// Over standard-conforming tuple implementations, this appears to accelerate compilation times by over 3x.
 
 // EBO stands for "empty base optimization."
 // We use this technique to ensure that cute::tuple
@@ -69,6 +83,12 @@ namespace detail
 // of cute::tuple that have no data (like integral_constant).
 // Otherwise, cute::tuple would need to spend at least 1 byte
 // for each of its template arguments.
+//
+// This is one way in which cute::tuple differs from std::tuple.
+// Empty types in the template argument list are not even constructed,
+// and do not have unique element addresses.  In fact, they are not
+// even members of the tuple or stored in any way.  Calling `get`
+// constructs and returns an instance of an empty type on demand.
 //
 // EBO always "holds" a single value of type T.
 // N is like an array index that TupleBase uses
@@ -109,9 +129,8 @@ struct EBO<N, T, false>
   CUTE_HOST_DEVICE constexpr
   EBO() : t_{} {}
 
-  template <class U>
   CUTE_HOST_DEVICE constexpr
-  EBO(U const& u) : t_{u} {}
+  EBO(T const& t) : t_{t} {}
 
   T t_;
 };
@@ -126,18 +145,14 @@ CUTE_HOST_DEVICE constexpr T& getv(EBO<N, T, false>& x)
 
 template <size_t N, class T>
 CUTE_HOST_DEVICE constexpr T&& getv(EBO<N, T, false>&& x)
-{ return static_cast<T&&>(x.t_); }
+{ return cute::move(x.t_); }
 
 template <class IdxSeq, class... T>
 struct TupleBase;
 
-// Base class of cute::tuple.
-// It inherits from EBO<i, t> for each (i, t) in (I..., T...).
-// The actual storage (for nonempty t) lives in the base classes.
-// index_sequence is a way to wrap up a sequence of zero or more
-// compile-time integer values in a single type.
-// We only ever use index_sequence<0, 1, ..., sizeof...(T)> in practice,
-// as the type alias TupleBase below indicates.
+// Base class of cute::tuple binds each element to an index
+// by inheriting from EBO<i, t> for each (i, t) in (I..., T...).
+// The storage (for nonempty t) lives in the base classes.
 template <size_t... I, class... T>
 struct TupleBase<index_sequence<I...>, T...>
     : EBO<I,T>...
@@ -145,15 +160,8 @@ struct TupleBase<index_sequence<I...>, T...>
   CUTE_HOST_DEVICE constexpr
   TupleBase() {}
 
-  template <class... U>
-  CUTE_HOST_DEVICE constexpr explicit
-  TupleBase(U const&... u)
-      : EBO<I,T>(u)... {}
-
-  template <class... U>
   CUTE_HOST_DEVICE constexpr
-  TupleBase(TupleBase<index_sequence<I...>, U...> const& u)
-      : EBO<I,T>(getv(static_cast<EBO<I,U> const&>(u)))... {}
+  TupleBase(T const&... t) : EBO<I,T>(t)... {}
 };
 
 } // end namespace detail
@@ -169,11 +177,6 @@ struct TupleBase<index_sequence<I...>, T...>
 //
 // Inheriting from the above alias TupleBase
 // causes MSVC 2022 build errors when assigning one tuple to another:
-//
-// illegal member initialization:
-// 'TupleBase< /* template arguments */ >' is not a base or member
-//
-// Not using the alias or any kind of alias fixed the errors.
 // In summary: this is verbose as a work-around for MSVC build errors.
 template <class... T>
 struct tuple : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>
@@ -181,15 +184,13 @@ struct tuple : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>
   CUTE_HOST_DEVICE constexpr
   tuple() {}
 
-  template <class... U>
   CUTE_HOST_DEVICE constexpr
-  tuple(U const&... u) : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>(u...) {}
-
-  template <class... U>
-  CUTE_HOST_DEVICE constexpr
-  tuple(tuple<U...> const& u)
-      : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>(static_cast<detail::TupleBase<make_index_sequence<sizeof...(U)>, U...> const&>(u)) {}
+  tuple(T const&... t) : detail::TupleBase<make_index_sequence<sizeof...(T)>, T...>(t...) {}
 };
+
+template <>
+struct tuple<>
+{};
 
 //
 // get for cute::tuple (just like std::get for std::tuple)
@@ -236,6 +237,8 @@ find(tuple<T...> const& t) noexcept
   return detail::findt<X>(t);
 }
 
+#endif // CUTLASS_USE_PACKED_TUPLE
+
 //
 // Custom is_tuple trait simply checks the existence of tuple_size
 //      and assumes std::get<I>(.), std::tuple_element<I,.>
@@ -250,6 +253,9 @@ auto has_tuple_size(...) -> false_type;
 
 template <class T>
 struct is_tuple : decltype(detail::has_tuple_size((T*)0)) {};
+
+template<typename T>
+constexpr bool is_tuple_v = cute::is_tuple<T>::value;
 
 //
 // make_tuple (value-based implementation)
@@ -365,10 +371,10 @@ tuple_cat(T0 const& t0, T1 const& t1, T2 const& t2, T3 const& t3, T4 const& t4,
   return cute::make_tuple(get<I0>(t0)..., get<I1>(t1)..., get<I2>(t2)..., get<I3>(t3)..., get<I4>(t4)...);
 }
 
-template<class T0, class T1>
+template <class T0, class T1>
 struct tuple_cat_static;
 
-template<class... T0s, class... T1s>
+template <class... T0s, class... T1s>
 struct tuple_cat_static<tuple<T0s...>, tuple<T1s...>> {
   using type = tuple<T0s..., T1s...>;
 };
@@ -549,20 +555,12 @@ tuple_cat(Tuples const&... ts)
 
 namespace detail {
 
-template <size_t I, class TupleA, class TupleB>
+template <class TupleA, class TupleB, size_t... I>
 CUTE_HOST_DEVICE constexpr
 auto
-equal_impl(TupleA const& a, TupleB const& b)
+equal_impl(TupleA const& a, TupleB const& b, index_sequence<I...>)
 {
-  if constexpr (I == tuple_size<TupleA>::value) {
-    return cute::true_type{};   // Terminal: TupleA is exhausted
-  } else if constexpr (I == tuple_size<TupleB>::value) {
-    return cute::false_type{};  // Terminal: TupleA is not exhausted, TupleB is exhausted
-  } else {
-    return (get<I>(a) == get<I>(b)) && equal_impl<I+1>(a,b);
-  }
-
-  CUTE_GCC_UNREACHABLE;
+  return (cute::true_type{} && ... && (get<I>(a) == get<I>(b)));
 }
 
 } // end namespace detail
@@ -573,7 +571,13 @@ CUTE_HOST_DEVICE constexpr
 auto
 operator==(TupleT const& t, TupleU const& u)
 {
-  return detail::equal_impl<0>(t, u);
+  if constexpr (tuple_size<TupleT>::value == tuple_size<TupleU>::value) {
+    return detail::equal_impl(t, u, make_index_sequence<tuple_size<TupleT>::value>{});
+  } else {
+    return cute::false_type{};
+  }
+
+  CUTE_GCC_UNREACHABLE;
 }
 
 template <class TupleT, class TupleU,
@@ -627,26 +631,18 @@ operator!=(TupleT const& t, TupleU const& u)
 namespace detail {
 
 template <class Tuple, size_t... Is>
-CUTE_HOST_DEVICE void print_tuple(Tuple const& t,
-                                  index_sequence<Is...>, char s = '(', char e = ')')
+CUTE_HOST_DEVICE void print_tuple(Tuple const& t, index_sequence<Is...>, char s = '(', char e = ')')
 {
-  using eat = int[];
   using cute::print;
-  (void) eat {(print(s), 0),
-              (print(Is == 0 ? "" : ","), print(get<Is>(t)), 0)...,
-              (print(e), 0)};
+  print(s); ((void(print(Is == 0 ? '\0' : ',')), void(print(get<Is>(t)))), ...); print(e);
 }
 
 #if !defined(__CUDACC_RTC__)
 template <class Tuple, std::size_t... Is>
-CUTE_HOST std::ostream& print_tuple_os(std::ostream& os, Tuple const& t,
-                                       index_sequence<Is...>, char s = '(', char e = ')')
+CUTE_HOST std::ostream& print_tuple_os(std::ostream& os, Tuple const& t, index_sequence<Is...>, char s = '(', char e = ')')
 {
-  using eat = int[];
-  (void) eat {(void(os << s), 0),
-              (void(os << (Is == 0 ? "" : ",") << get<Is>(t)), 0)...,
-              (void(os << e), 0)};
-  return os;
+  os << s; (void(os << (Is == 0 ? '\0' : ',') << get<Is>(t)), ...);
+  return os << e;
 }
 #endif // !defined(__CUDACC_RTC__)
 
@@ -669,6 +665,8 @@ CUTE_HOST std::ostream& operator<<(std::ostream& os, Tuple const& t)
 #endif // !defined(__CUDACC_RTC__)
 
 } // end namespace cute
+
+#if ! defined(CUTLASS_USE_PACKED_TUPLE)
 
 namespace CUTE_STL_NAMESPACE
 {
@@ -707,7 +705,7 @@ namespace std
 template <class... _Tp>
 struct tuple_size;
 
-template<size_t _Ip, class... _Tp>
+template <size_t _Ip, class... _Tp>
 struct tuple_element;
 #endif
 
@@ -731,5 +729,7 @@ struct tuple_element<I, const cute::tuple<T...>>
     : CUTE_STL_NAMESPACE::tuple_element<I, const CUTE_STL_NAMESPACE::tuple<T...>>
 {};
 
-} // end namepsace std
+} // end namespace std
 #endif // CUTE_STL_NAMESPACE_IS_CUDA_STD
+
+#endif // CUTLASS_USE_PACKED_TUPLE

@@ -31,12 +31,9 @@
 #pragma once
 
 #include <cute/config.hpp>
-
 #include <cute/arch/mma.hpp>
-
 #include <cute/atom/mma_traits.hpp>
-
-#include <cute/tensor.hpp>
+#include <cute/tensor_impl.hpp>
 #include <cute/util/type_traits.hpp>
 
 namespace cute {
@@ -78,7 +75,7 @@ struct MMA_Atom<MMA_Traits<Args...>>
   CUTE_HOST_DEVICE
   auto
   with(TraitsArgs&&... args) const {
-    auto traits = Traits::with(std::forward<TraitsArgs>(args)...);
+    auto traits = Traits::with(static_cast<TraitsArgs&&>(args)...);
     return MMA_Atom<decltype(traits)>{traits};
   }
 
@@ -103,7 +100,7 @@ struct MMA_Atom<MMA_Traits<Args...>>
     static_assert(BLayout::rank == 1, "Expected rank-1 B tensor");
     static_assert(CLayout::rank == 1, "Expected rank-1 C tensor");
 
-    return mma_unpack(*this, D, A, B, C);
+    return mma_unpack(static_cast<Traits const&>(*this), D, A, B, C);
   }
 
   // Three arguments reproduces C
@@ -157,7 +154,7 @@ struct MMA_Atom<MMA_Traits<Args...>>
       // If the intended FrgTypeA is a view (of the current tensor), forward the whole
       static_assert(is_same<ValTypeA, typename remove_cvref_t<ATensor>::value_type>::value
                       , "Expecting ValTypeA type");
-      return make_tensor<FrgTypeA>(std::forward<ATensor>(atensor));
+      return make_tensor<FrgTypeA>(static_cast<ATensor&&>(atensor));
     } else {
       // Else, the intended FrgTypeA is a value type, construct a new tensor with a fragment layout
       return make_fragment_like<FrgTypeA>(atensor);
@@ -179,7 +176,7 @@ struct MMA_Atom<MMA_Traits<Args...>>
       // If the intended FrgTypeB is a view (of the current tensor), forward the whole
       static_assert(is_same<ValTypeB, typename remove_cvref_t<BTensor>::value_type>::value
                       , "Expecting ValTypeB type");
-      return make_tensor<FrgTypeB>(std::forward<BTensor>(btensor));
+      return make_tensor<FrgTypeB>(static_cast<BTensor&&>(btensor));
     } else {
       // Else, the intended FrgTypeB is a value type, construct a new tensor with a fragment layout
       return make_fragment_like<FrgTypeB>(btensor);
@@ -213,7 +210,7 @@ struct TiledMMA : MMA_Atom
 
   static_assert(   rank_v<AtomLayoutMNK>  == 3,   "TiledMMA requires rank-3 AtomLayoutMNK");
   static_assert(   rank_v<PermutationMNK> == 3,   "TiledMMA requires rank-3 PermutationMNK");
-  static_assert(  is_tile<PermutationMNK>::value, "TiledMMA requires independent permutations of MNK.");
+  static_assert( is_tuple<PermutationMNK>::value, "TiledMMA requires independent permutations of MNK.");
   static_assert(is_static<PermutationMNK>::value, "TiledMMA requires static permutations of MNK.");
 
   using ThrLayoutVMNK = decltype(tiled_product(AtomThrID{}, AtomLayoutMNK{}));
@@ -246,12 +243,9 @@ struct TiledMMA : MMA_Atom
   thrfrg_C(CTensor&& ctensor) const
   {
     CUTE_STATIC_ASSERT_V(rank(ctensor) >= Int<2>{});
-    //CUTE_STATIC_ASSERT_V(size<0>(ctensor) % size<0>(TiledShape_MNK{}) == Int<0>{});
-    //CUTE_STATIC_ASSERT_V(size<1>(ctensor) % size<1>(TiledShape_MNK{}) == Int<0>{});
-
     // Reorder the tensor for the TiledAtom
-    auto t_tile = make_tile(get<0>(PermutationMNK{}),
-                            get<1>(PermutationMNK{}));
+    auto t_tile = make_tile(permutation_mnk<0>(),
+                            permutation_mnk<1>());
     auto t_tensor = logical_divide(ctensor, t_tile);                 // (PermM,PermN)
 
     // Tile the tensor for the Atom
@@ -288,12 +282,9 @@ struct TiledMMA : MMA_Atom
   thrfrg_A(ATensor&& atensor) const
   {
     CUTE_STATIC_ASSERT_V(rank(atensor) >= Int<2>{});
-    //CUTE_STATIC_ASSERT_V(size<0>(atensor) % size<0>(TiledShape_MNK{}) == Int<0>{});
-    //CUTE_STATIC_ASSERT_V(size<1>(atensor) % size<2>(TiledShape_MNK{}) == Int<0>{});
-
     // Reorder the tensor for the TiledAtom
-    auto t_tile = make_tile(get<0>(PermutationMNK{}),
-                            get<2>(PermutationMNK{}));
+    auto t_tile = make_tile(permutation_mnk<0>(),
+                            permutation_mnk<2>());
     auto t_tensor = logical_divide(atensor, t_tile);                 // (PermM,PermK)
 
     // Tile the tensor for the Atom
@@ -330,21 +321,18 @@ struct TiledMMA : MMA_Atom
   thrfrg_B(BTensor&& btensor) const
   {
     CUTE_STATIC_ASSERT_V(rank(btensor) >= Int<2>{});
-    //CUTE_STATIC_ASSERT_V(size<0>(btensor) % size<1>(TiledShape_MNK{}) == Int<0>{});
-    //CUTE_STATIC_ASSERT_V(size<1>(btensor) % size<2>(TiledShape_MNK{}) == Int<0>{});
-
     // Reorder the tensor for the TiledAtom
-    auto t_tile = make_tile(get<1>(PermutationMNK{}),
-                            get<2>(PermutationMNK{}));
+    auto t_tile = make_tile(permutation_mnk<1>(),
+                            permutation_mnk<2>());
     auto t_tensor = logical_divide(btensor, t_tile);                 // (PermN,PermK)
 
     // Tile the tensor for the Atom
-    auto a_tile = make_tile(make_layout(size<1>(AtomShape_MNK{})),
+    auto b_tile = make_tile(make_layout(size<1>(AtomShape_MNK{})),
                             make_layout(size<2>(AtomShape_MNK{})));
-    auto a_tensor = zipped_divide(t_tensor, a_tile);                 // ((AtomN,AtomK),(RestN,RestK))
+    auto b_tensor = zipped_divide(t_tensor, b_tile);                 // ((AtomN,AtomK),(RestN,RestK))
 
-    // Transform the Atom mode from (M,K) to (Thr,Val)
-    auto tv_tensor = a_tensor.compose(AtomLayoutB_TV{},_);           // ((ThrV,FrgV),(RestN,RestK))
+    // Transform the Atom mode from (N,K) to (Thr,Val)
+    auto tv_tensor = b_tensor.compose(AtomLayoutB_TV{},_);           // ((ThrV,FrgV),(RestN,RestK))
 
     // Tile the tensor for the Thread
     auto thr_tile = make_tile(_,
@@ -378,21 +366,23 @@ struct TiledMMA : MMA_Atom
   // Utility for printing and visualization
   //
 
+  // The permutation applied to the MNK-mode data
+  template <int I>
+  CUTE_HOST_DEVICE constexpr
+  auto
+  permutation_mnk() const {
+    static_assert(0 <= I && I < 3);
+    auto perm = get<I>(PermutationMNK{});
+    return conditional_return(is_underscore<decltype(perm)>{}, size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk()), perm);
+  }
+
   // The size of the MNK-mode
   template <int I>
   CUTE_HOST_DEVICE constexpr
   auto
   tile_size_mnk() const {
     static_assert(0 <= I && I < 3);
-    auto core_size = size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk());
-    [[maybe_unused]] auto perm_size = size<I>(PermutationMNK{});
-    if constexpr (is_underscore<decltype(perm_size)>::value) {
-      return core_size;
-    } else {
-      return cute::max(core_size, perm_size);
-    }
-  
-    CUTE_GCC_UNREACHABLE;
+    return size(permutation_mnk<I>());
   }
 
   CUTE_HOST_DEVICE constexpr
@@ -493,7 +483,7 @@ struct TiledMMA : MMA_Atom
     // (bthrid,val) -> (N,K)
     auto layoutB_TV = thrfrg_B(ref_B);
 
-    // (ThrV,(ThrM,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
+    // (ThrV,(ThrN,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
     auto btile = make_tile(_,
                            make_tile(make_layout(make_shape (size<1>(thr_layout_vmnk_), size<2>(thr_layout_vmnk_)),
                                                  make_stride(               Int<0>{} ,                Int<1>{} )),
@@ -517,7 +507,7 @@ struct ThrMMA : TiledMMA
   auto
   partition_C(CTensor&& ctensor) const
   {
-    auto thr_tensor = make_tensor(std::forward<CTensor>(ctensor).data(), this->thrfrg_C(ctensor.layout()));
+    auto thr_tensor = make_tensor(static_cast<CTensor&&>(ctensor).data(), this->thrfrg_C(ctensor.layout()));
 
     auto thr_vmn = make_coord(get<0>(thr_vmnk_), make_coord(get<1>(thr_vmnk_), get<2>(thr_vmnk_)));
     return thr_tensor(thr_vmn, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
@@ -528,7 +518,7 @@ struct ThrMMA : TiledMMA
   auto
   partition_A(ATensor&& atensor) const
   {
-    auto thr_tensor = make_tensor(std::forward<ATensor>(atensor).data(), this->thrfrg_A(atensor.layout()));
+    auto thr_tensor = make_tensor(static_cast<ATensor&&>(atensor).data(), this->thrfrg_A(atensor.layout()));
 
     auto thr_vmk = make_coord(get<0>(thr_vmnk_), make_coord(get<1>(thr_vmnk_), get<3>(thr_vmnk_)));
     return thr_tensor(thr_vmk, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
@@ -539,7 +529,7 @@ struct ThrMMA : TiledMMA
   auto
   partition_B(BTensor&& btensor) const
   {
-    auto thr_tensor = make_tensor(std::forward<BTensor>(btensor).data(), this->thrfrg_B(btensor.layout()));
+    auto thr_tensor = make_tensor(static_cast<BTensor&&>(btensor).data(), this->thrfrg_B(btensor.layout()));
 
     auto thr_vnk = make_coord(get<0>(thr_vmnk_), make_coord(get<2>(thr_vmnk_), get<3>(thr_vmnk_)));
     return thr_tensor(thr_vnk, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
@@ -716,6 +706,7 @@ print(MMA_Atom<MMA_Traits<Args...>> const&)
   using Atom = MMA_Atom<MMA_Traits<Args...>>;
   print("MMA_Atom\n");
   print("  ThrID:      "); print(typename Atom::ThrID{});      print("\n");
+  print("  Shape_MNK:  "); print(typename Atom::Shape_MNK{});  print("\n");
   print("  LayoutA_TV: "); print(typename Atom::LayoutA_TV{}); print("\n");
   print("  LayoutB_TV: "); print(typename Atom::LayoutB_TV{}); print("\n");
   print("  LayoutC_TV: "); print(typename Atom::LayoutC_TV{}); print("\n");
@@ -744,7 +735,15 @@ print(ThrMMA<TiledMMA, ThrVMNK> const& thr_mma)
 
 template <class... Args>
 CUTE_HOST_DEVICE
-auto
+void
+print_latex(MMA_Atom<Args...> const& mma_atom)
+{
+  print_latex(make_tiled_mma(mma_atom));
+}
+
+template <class... Args>
+CUTE_HOST_DEVICE
+void
 print_latex(TiledMMA<Args...> const& mma)
 {
   auto layout_and_thrid_C = mma.get_layoutC_MN();
@@ -764,7 +763,7 @@ print_latex(TiledMMA<Args...> const& mma)
                   layoutB_NK, thrID_B);
 }
 
-// MNK MMA Layout to console printer -- 8-value color coded by thread
+// MNK MMA Layout to console printer
 template <class LayoutC, class ThrIDC,
           class LayoutA, class ThrIDA,
           class LayoutB, class ThrIDB>

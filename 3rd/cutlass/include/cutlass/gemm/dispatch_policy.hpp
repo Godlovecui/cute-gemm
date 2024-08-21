@@ -37,8 +37,52 @@
 #include "cute/numeric/integral_constant.hpp"
 //////////////////////////////////////////////////////////////////////////////
 
+namespace cutlass::detail {
+
+template <class T, template <int...> class U>
+struct is_kernel_tag_of : cute::false_type {};
+
+template <template <int...> class U, int... Args>
+struct is_kernel_tag_of<U<Args...>, U> : cute::true_type {};
+
+template <class T, template <int...> class U>
+constexpr bool is_kernel_tag_of_v = is_kernel_tag_of<T, U>::value;
+
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
 namespace cutlass::gemm {
 using namespace cute;
+
+//////////////////////////////////////////////////////////////////////////////
+
+namespace detail {
+
+enum class KernelInputTransformType {
+    FastF32,
+    InterleavedComplexTF32
+};
+
+} // namespace detail
+
+//////////////////////////////////////////////////////////////////////////////
+
+namespace kernel::detail {
+
+// Has_SwapAB<T>::value will be true only if:
+//   class T has member SwapAB and T::SwapAB is true
+template <typename T, typename = void>
+struct Has_SwapAB { static constexpr bool value = false; };
+
+template <typename T>
+struct Has_SwapAB <T, CUTE_STL_NAMESPACE::void_t<decltype(T::SwapAB)>>
+{ static constexpr bool value = T::SwapAB; };
+
+template <typename T>
+static constexpr bool Has_SwapAB_v = Has_SwapAB<T>::value;
+
+} // namespace kernel::detail
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -58,7 +102,7 @@ struct KernelPtrArrayTmaWarpSpecializedCooperative { };
 //////////////////////////////////////////////////////////////////////////////
 
 //
-// Builder dispatch policies (not a part of the main CUTLASS layers, simply used to opt into 
+// Builder dispatch policies (not a part of the main CUTLASS layers, simply used to opt into
 // specific collective builder dispatches)
 //
 
@@ -111,12 +155,15 @@ struct MainloopSm80CpAsyncUnpredicated {
 };
 
 // n-buffer in smem (cp.async), pipelined with registers, with predicated gmem loads
-template<int Stages_>
+template<
+  int Stages_,
+  class ClusterShape_ = Shape<_1,_1,_1>
+>
 struct MainloopSm80CpAsync {
   constexpr static int Stages = Stages_;
-  using ArchTag = arch::Sm80;
+  using ArchTag = cute::conditional_t<(size(ClusterShape_{}) > 1), arch::Sm90, arch::Sm80>;
   using Schedule = KernelMultistage;
-  using ClusterShape = Shape<_1,_1,_1>;
+  using ClusterShape = ClusterShape_;
 };
 
 // n-buffer in smem (cp.async), pipelined with Hopper GMMA, with predicated gmem loads, warp specialized dynamic schedule
@@ -219,7 +266,7 @@ template<
   class KernelSchedule = KernelTmaWarpSpecialized
 >
 struct MainloopSm90TmaGmmaWarpSpecializedFP8
-  : MainloopSm90TmaGmmaWarpSpecialized<Stages_, ClusterShape_, KernelSchedule> { 
+  : MainloopSm90TmaGmmaWarpSpecialized<Stages_, ClusterShape_, KernelSchedule> {
   static_assert(
     cute::is_same_v<KernelSchedule, KernelTmaWarpSpecialized> ||
     cute::is_same_v<KernelSchedule, KernelTmaWarpSpecializedPingpong> ||

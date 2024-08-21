@@ -34,16 +34,6 @@
           8 bits of exponent and 7 bit of mantissa.
 */
 
-/*
-  Note:  CUTLASS 3x increases the host compiler requirements to C++17. However, certain
-         existing integrations of CUTLASS require C++11 host compilers.
-
-         Until this requirement can be lifted, certain headers with this annotation are required
-         to be remain consistent with C++11 syntax.
-
-         C++11 compatibility is enforced by `cutlass_test_unit_core_cpp11`.
-*/
-
 #pragma once
 
 #if defined(__CUDACC_RTC__)
@@ -109,6 +99,17 @@ private:
 public:
   /// Default constructor
   bfloat16_t() = default;
+
+  /// Reinterpret cast from CUDA's __nv_bfloat16 type
+  CUTLASS_HOST_DEVICE
+  explicit bfloat16_t(__nv_bfloat16 const & x) {
+    #if defined(__CUDA_ARCH__)
+    storage = reinterpret_cast<uint16_t const &>(x);
+    #else
+    __nv_bfloat16_raw raw(x);
+    std::memcpy(&storage, &raw.x, sizeof(storage));
+    #endif
+  }
 
   /// Floating-point conversion - round toward nearest
   CUTLASS_HOST_DEVICE

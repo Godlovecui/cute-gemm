@@ -116,10 +116,10 @@ static_assert(is_valid_tile_scheduler, "SM70 kernel does not support specializin
 
   // Kernel entry point API
   struct Params {
-    GemmUniversalMode mode;
-    ProblemShape problem_shape;
-    MainloopParams mainloop;
-    EpilogueParams epilogue;
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
   };
 
   //
@@ -150,15 +150,16 @@ static_assert(is_valid_tile_scheduler, "SM70 kernel does not support specializin
     return mode_implementable && TileScheduler::can_implement(args.scheduler);
   }
 
-  static int
+  static size_t
   get_workspace_size(Arguments const& args) {
-    int workspace_size = 0;
+    size_t workspace_size = 0;
     return workspace_size;
   }
 
   static
   cutlass::Status
-  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr, 
+    CudaHostAdapter* cuda_adapter = nullptr) {
     cutlass::Status status = Status::kSuccess;
 
     return status;
@@ -195,10 +196,7 @@ static_assert(is_valid_tile_scheduler, "SM70 kernel does not support specializin
     // Separate out problem shape for convenience
     // Optionally append 1s until problem shape is rank-4 in case its is only rank-3 (MNK)
     auto problem_shape_MNKL = append<4>(params.problem_shape, Int<1>{});
-    auto M = get<0>(problem_shape_MNKL);
-    auto N = get<1>(problem_shape_MNKL);
-    auto K = get<2>(problem_shape_MNKL);
-    auto L = get<3>(problem_shape_MNKL);
+    auto [M,N,K,L] = problem_shape_MNKL;
 
     // Preconditions
     static_assert(cute::rank(StrideA{}) == 3, "StrideA must be rank-3: [M, K, L]. If batch mode is not needed, set L stride to Int<0>.");
@@ -250,7 +248,6 @@ static_assert(is_valid_tile_scheduler, "SM70 kernel does not support specializin
       thread_idx,
       smem_buf
     );
-
     // Epilogue and write to gD
     CollectiveEpilogue epilogue{params.epilogue};
     epilogue(

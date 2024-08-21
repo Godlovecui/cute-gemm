@@ -30,12 +30,34 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cute/config.hpp>
-#include <vector_types.h>
-#include <cutlass/numeric_types.h>
+#include "cutlass/detail/dependent_false.hpp"
 
-namespace cute {
+////////////////////////////////////////////////////////////////////////////////
 
-using cutlass::half_t;
+namespace cutlass::conv::kernel {
 
-} // end namespace cute
+////////////////////////////////////////////////////////////////////////////////
+
+/*
+ * Stateless universal device CONV kernel type that treats CONV as
+ * a composition of a collective mainloop and a collective epilogue.
+**/
+template <
+  class CollectiveMainloop_,
+  class CollectiveEpilogue_,
+  class TileSchedulerTag_ = void,
+  class Enable = void
+>
+class ConvUniversal {
+  static_assert(cutlass::detail::dependent_false<Enable>,
+      "Could not find a valid specialization at the kernel layer to dispatch against.");
+};
+
+////////////////////////////////////////////////////////////////////////////////
+
+} // namespace cutlass::conv::kernel
+
+////////////////////////////////////////////////////////////////////////////////
+
+#include "cutlass/conv/kernel/sm90_implicit_gemm_tma_warpspecialized.hpp"
+////////////////////////////////////////////////////////////////////////////////

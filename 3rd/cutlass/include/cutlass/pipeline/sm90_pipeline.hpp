@@ -49,7 +49,6 @@ using namespace cute;
 enum class BarrierStatus : uint32_t {
   WaitAgain = 0u,
   WaitDone  = 1u,
-  WaitOnly = 2u
 };
 
 class ArrivalToken {
@@ -62,7 +61,7 @@ public:
 
   CUTLASS_HOST_DEVICE
   BarrierStatus get() const {
-    return barrier_status_;;
+    return barrier_status_;
   }
 
   CUTLASS_HOST_DEVICE
@@ -150,7 +149,12 @@ struct PipelineState {
   }
 
   CUTLASS_DEVICE
-  PipelineState& operator=(const PipelineState& other) {
+  PipelineState& operator+=(uint32_t num_iterations) {
+    return advance(num_iterations);
+  }
+
+  CUTLASS_DEVICE
+  PipelineState& operator=(PipelineState const& other) {
     index_ = other.index();
     phase_ = other.phase();
     count_ = other.count();
@@ -158,7 +162,7 @@ struct PipelineState {
   }
 
   CUTLASS_DEVICE
-  PipelineState advance(uint32_t num_iterations) {
+  PipelineState& advance(uint32_t num_iterations) {
     if constexpr (Stages > 0) {
       // Number of iterations cross over the stage boundary => flipped phase
       if ((num_iterations < Stages) && (index_ + num_iterations) >= Stages ) {
@@ -181,7 +185,7 @@ struct PipelineState {
   }
 };
 
-template<class Pipeline>  
+template<class Pipeline>
 CUTLASS_DEVICE
 PipelineState<Pipeline::Stages> make_producer_start_state() {
   // Producer starts with an opposite phase as the buffers are initially empty
@@ -236,7 +240,7 @@ public :
       , full_barrier_ptr_(&storage.full_barrier_[0])
       , empty_barrier_ptr_(&storage.empty_barrier_[0]) {
 
-    int warp_idx = canonical_warp_idx();
+    int warp_idx = canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
 
     if (warp_idx == 0 && lane_predicate == 1) {
@@ -259,7 +263,6 @@ public :
     dim3 block_id = cute::block_id_in_cluster();
     auto cluster_size = cute::size(cluster_shape);
     static constexpr int MaxClusterSize = 16;
-    static_assert(cluster_size <= MaxClusterSize, "ERROR : Cluster size too large !" );
 
     // STEP 1 : Use Cute Layout function to generate an optimal dst block-id (0-15)
     if (params_.num_consumers % NumThreadsPerWarpGroup == 0) {
@@ -290,7 +293,7 @@ public :
     is_signalling_thread_ &= dst_blockid_ < cluster_size;
     is_signalling_thread_ &= is_same_row_or_col(dst_blockid_, block_id, cluster_shape);
   }
-  
+
   template <typename ClusterShape>
   CUTLASS_DEVICE
   bool is_same_row_or_col(int dst_block_id, dim3 block_id, ClusterShape cluster_shape) {
@@ -306,7 +309,7 @@ public :
   // Four member functions are always used in pairs:
   //
   // * producer_try_acquire and producer_acquire, and
-  // * consumer_try_wait and consumer_wait. 
+  // * consumer_try_wait and consumer_wait.
   //
   // The two functions with "try" in their names are called "try" functions,
   // and the other two are conceptually "finalize" functions.
@@ -340,7 +343,7 @@ public :
   CUTLASS_DEVICE
   void producer_tail(PipelineState state) {
     for (int count = 0; count < Stages; ++count) {
-      producer_acquire(state, {BarrierStatus::WaitOnly});  
+      empty_barrier_ptr_[state.index()].wait(state.phase());
       ++state;
     }
   }
@@ -362,7 +365,7 @@ public :
   ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
     return consumer_test_wait(state.index(), state.phase(), skip_wait);
   }
-  
+
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state) {
     consumer_wait(state.index(), state.phase());
@@ -390,7 +393,7 @@ private :
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -398,9 +401,6 @@ private :
   void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
     if (barrier_token != BarrierStatus::WaitDone) {
       empty_barrier_ptr_[stage].wait(phase);
-    }
-    if (barrier_token == BarrierStatus::WaitOnly) {
-      return;
     }
 
     if (params_.is_leader) {
@@ -452,7 +452,7 @@ private :
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -461,10 +461,10 @@ private :
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].test_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
-  
+
   // Wait for producer to commit transactions (done by TMA)
   CUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase) {
@@ -655,7 +655,7 @@ public :
     , full_barrier_ptr_(storage.full_barrier_.data())
     , empty_barrier_ptr_(storage.empty_barrier_.data()) {
 
-    int warp_idx = canonical_warp_idx();
+    int warp_idx = canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
 
     // Barrier FULL, EMPTY init
@@ -675,7 +675,7 @@ public :
   // Four member functions are always used in pairs:
   //
   // * producer_try_acquire and producer_acquire, and
-  // * consumer_try_wait and consumer_wait. 
+  // * consumer_try_wait and consumer_wait.
   //
   // The two functions with "try" in their names are called "try" functions,
   // and the other two are conceptually "finalize" functions.
@@ -714,7 +714,7 @@ public :
   CUTLASS_DEVICE
   void producer_tail(PipelineState state) {
     for (int count = 0; count < Stages; ++count) {
-      producer_acquire(state);  
+      producer_acquire(state);
       ++state;
     }
   }
@@ -736,7 +736,7 @@ public :
   ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
     return consumer_test_wait(state.index(), state.phase(), skip_wait);
   }
-  
+
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state, ConsumerToken barrier_token = {BarrierStatus::WaitAgain}) {
     consumer_wait(state.index(), state.phase(), barrier_token);
@@ -757,7 +757,7 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -789,7 +789,7 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -798,10 +798,10 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].test_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
-  
+
   CUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
     if (barrier_token == BarrierStatus::WaitAgain) {
@@ -820,20 +820,31 @@ private:
 // Simple producer-consumer async Pipeline class
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
-template <int Stages_>
-class PipelineAsync {
-public :
-  using FullBarrier = cutlass::arch::ClusterBarrier;
-  using EmptyBarrier = cutlass::arch::ClusterBarrier;
-  using ProducerBarrierType = FullBarrier::ValueType;
-  using ConsumerBarrierType = EmptyBarrier::ValueType;
-  static constexpr uint32_t Stages = Stages_;
-  using PipelineState = cutlass::PipelineState<Stages>;
 
-  struct SharedStorage {
+namespace PipelineDetail {
+  template<int Stages>
+  using PipelineAsyncPipelineState = cutlass::PipelineState<Stages>;
+
+  template<int Stages>
+  struct PipelineAsyncSharedStorage {
+    using FullBarrier = cutlass::arch::ClusterBarrier;
+    using EmptyBarrier = cutlass::arch::ClusterBarrier;
+
     FullBarrier full_barrier_[Stages];
     EmptyBarrier empty_barrier_[Stages];
   };
+};
+
+template <int Stages_>
+class PipelineAsync {
+public :
+  static constexpr uint32_t Stages = Stages_;
+  using SharedStorage = PipelineDetail::PipelineAsyncSharedStorage<Stages>;
+  using FullBarrier = typename SharedStorage::FullBarrier;
+  using EmptyBarrier = typename SharedStorage::EmptyBarrier;
+  using ProducerBarrierType = typename FullBarrier::ValueType;
+  using ConsumerBarrierType = typename EmptyBarrier::ValueType;
+  using PipelineState = PipelineDetail::PipelineAsyncPipelineState<Stages>;
 
   enum class ThreadCategory {
     NonParticipant,
@@ -863,7 +874,7 @@ public :
       full_barrier_ptr_(&storage.full_barrier_[0]),
       empty_barrier_ptr_(&storage.empty_barrier_[0]) {
 
-    int warp_idx = canonical_warp_idx();
+    int warp_idx = canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
 
     // Barrier FULL, EMPTY init
@@ -883,7 +894,7 @@ public :
   // Four member functions are always used in pairs:
   //
   // * producer_try_acquire and producer_acquire, and
-  // * consumer_try_wait and consumer_wait. 
+  // * consumer_try_wait and consumer_wait.
   //
   // The two functions with "try" in their names are called "try" functions,
   // and the other two are conceptually "finalize" functions.
@@ -923,7 +934,7 @@ public :
   CUTLASS_DEVICE
   void producer_tail(PipelineState state) {
     for (int count = 0; count < Stages; ++count) {
-      producer_acquire(state);  
+      producer_acquire(state);
       ++state;
     }
   }
@@ -945,7 +956,7 @@ public :
   ConsumerToken consumer_test_wait(PipelineState state, uint32_t skip_wait = false) {
     return consumer_test_wait(state.index(), state.phase(), skip_wait);
   }
-  
+
   CUTLASS_DEVICE
   void consumer_wait(PipelineState state, ConsumerToken barrier_token = {BarrierStatus::WaitAgain}) {
     consumer_wait(state.index(), state.phase(), barrier_token);
@@ -954,6 +965,11 @@ public :
   CUTLASS_DEVICE
   void consumer_release(PipelineState state) {
     consumer_release(state.index());
+  }
+
+  CUTLASS_DEVICE
+  ProducerBarrierType* producer_get_barrier(uint32_t stage) {
+    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
   }
 
 private:
@@ -966,7 +982,7 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -983,16 +999,11 @@ private:
   }
 
   CUTLASS_DEVICE
-  ProducerBarrierType* producer_get_barrier(uint32_t stage) {
-    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
-  }
-
-  CUTLASS_DEVICE
   ConsumerToken consumer_try_wait(uint32_t stage, uint32_t phase, uint32_t skip_wait) {
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
 
@@ -1001,13 +1012,13 @@ private:
     if (skip_wait) {
       return {BarrierStatus::WaitDone};
     }
-    uint32_t barrier_status = full_barrier_ptr_[stage].test_wait(phase);
+    bool barrier_status = full_barrier_ptr_[stage].test_wait(phase);
     return {static_cast<BarrierStatus>(barrier_status)};
   }
-  
+
   CUTLASS_DEVICE
   void consumer_wait(uint32_t stage, uint32_t phase) {
-    uint32_t done = full_barrier_ptr_[stage].test_wait(phase);
+    bool done = full_barrier_ptr_[stage].test_wait(phase);
     if (!done) {
       full_barrier_ptr_[stage].wait(phase);
     }
@@ -1036,14 +1047,24 @@ private:
 //
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<int SequenceDepth, int SequenceLength>
-class OrderedSequenceBarrier {
-public :
-  using Barrier = cutlass::arch::ClusterBarrier;
+namespace PipelineDetail {
 
-  struct SharedStorage {
-    Barrier barrier_[SequenceDepth][SequenceLength];
-  };
+template<int SequenceDepth, int SequenceLength>
+struct OrderedSequenceBarrierSharedStorage {
+  using Barrier = cutlass::arch::ClusterBarrier;
+  Barrier barrier_[SequenceDepth][SequenceLength];
+};
+
+} // namespace PipelineDetail
+
+template<int SequenceDepth_, int SequenceLength_>
+class OrderedSequenceBarrier {
+public:
+  static constexpr int SequenceDepth = SequenceDepth_;
+  static constexpr int SequenceLength = SequenceLength_;
+  using SharedStorage =
+    PipelineDetail::OrderedSequenceBarrierSharedStorage<SequenceDepth, SequenceLength>;
+  using Barrier = typename SharedStorage::Barrier;
 
   struct Params {
     uint32_t group_id;
@@ -1073,7 +1094,7 @@ public:
       barrier_ptr_(&storage.barrier_[0][0]),
       // Group 0 - starts with an opposite phase
       stage_({0, params.group_id == 0, 0}) {
-    int warp_idx = canonical_warp_idx();
+    int warp_idx = canonical_warp_idx_sync();
     int lane_predicate = cute::elect_one_sync();
 
     // Barrier FULL, EMPTY init
@@ -1115,6 +1136,33 @@ private:
     return barrier_ptr_[stage_.index() * Length + group_id];
   }
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Synchronization call. Blocks until barriers are initialized in shared memory.
+CUTLASS_DEVICE
+void
+pipeline_init_wait(int cluster_size) {
+  if (cluster_size > 1) {
+    cute::cluster_wait();
+  }
+  else {
+    __syncthreads();
+  }
+}
+
+// Used to guarantee that the Pipeline init is visible
+// to all producers and consumer threadblocks in the cluster
+CUTLASS_DEVICE
+void
+pipeline_init_arrive_relaxed(int cluster_size) {
+  if (cluster_size > 1) {
+    cute::cluster_arrive_relaxed();
+  }
+  else {
+    __syncthreads();
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

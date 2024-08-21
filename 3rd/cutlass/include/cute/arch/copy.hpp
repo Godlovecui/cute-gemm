@@ -33,7 +33,7 @@
 #include <cute/config.hpp>
 
 #include <cute/arch/util.hpp>
-#include <cute/numeric/int.hpp>
+#include <cute/numeric/numeric_types.hpp>
 
 namespace cute
 {
@@ -68,7 +68,7 @@ struct UniversalCopy
 
 //
 // Placeholder for the copy algorithm's stronger auto-vectorizing behavior
-//   that assumes alignment of dynamic layouts up to MaxVecBits
+//   that assumes alignment of pointers and dynamic layouts up to MaxVecBits
 //
 
 template <int MaxVecBits = 128>
@@ -80,13 +80,28 @@ struct AutoVectorizingCopyWithAssumedAlignment
 };
 
 //
-// Placeholder for the copy algorithm's default auto-vectorizing behavior
-//   that does not assume alignment of dynamic layouts
+// AutoVectorizingCopy alias assumes maximal alignment of pointers and dynamic strides.
+//   If this is not the case then AutoVectorizingCopyWithAssumedAlignment should be used instead
 //
 
-using AutoVectorizingCopy = AutoVectorizingCopyWithAssumedAlignment<8>;
+using AutoVectorizingCopy = AutoVectorizingCopyWithAssumedAlignment<128>;
 
-// Alias
-using DefaultCopy = AutoVectorizingCopy;
+//
+// DefaultCopy alias does not assume alignment of pointers or dynamic strides.
+//
+
+using DefaultCopy = AutoVectorizingCopyWithAssumedAlignment<8>;
+
+//
+// Global memory prefetch into L2
+//
+
+CUTE_HOST_DEVICE static void
+prefetch(void const* gmem_ptr)
+{
+#if defined(__CUDA_ARCH__)
+  asm volatile("prefetch.global.L2 [%0];\n" : : "l"(gmem_ptr) : "memory");
+#endif
+}
 
 } // end namespace cute

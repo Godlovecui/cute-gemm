@@ -38,7 +38,6 @@
 #include <cuda_runtime_api.h>
 #include "cutlass/cutlass.h"
 #include "cutlass/trace.h"
-
 #if defined(__CUDACC_RTC__)
 #include <cuda/std/type_traits>
 #else
@@ -98,6 +97,23 @@ struct ClusterLauncher {
 #endif
   {
 #if defined(CUTLASS_SM90_CLUSTER_LAUNCH_ENABLED)
+#if defined(CUTLASS_DEBUG_TRACE_LEVEL) && (CUTLASS_DEBUG_TRACE_LEVEL > 1)
+    if (kernel_function == nullptr) {
+      CUTLASS_TRACE_HOST("kernel_function is null");
+      return Status::kInvalid;
+    }
+    CUTLASS_TRACE_HOST("Checking previous error state before calling cudaFuncSetAttribute");
+    cudaError_t prevStatus = cudaGetLastError();
+    if (prevStatus != cudaSuccess) {
+      fprintf(stderr,
+              "[ ERROR: CUDA Runtime ] %s:%d: %s\n",
+              __FILE__,
+              __LINE__,
+              cudaGetErrorString(prevStatus));
+      return Status::kInvalid;
+    }
+    CUTLASS_TRACE_HOST("Calling cudaFuncSetAttribute");
+#endif
     // This attribute was added in CUDA 11.8.
     cudaError_t status =
         cudaFuncSetAttribute(
@@ -117,7 +133,8 @@ struct ClusterLauncher {
       size_t const smem_size,
       cudaStream_t cuda_stream,
       void const* kernel,
-      void** kernel_params) {
+      void** kernel_params,
+      bool launch_with_pdl = false) {
 #if defined(CUTLASS_SM90_CLUSTER_LAUNCH_ENABLED)
     if (check_cluster_dims(grid_dims, cluster_dims) != Status::kSuccess) {
       CUTLASS_TRACE_HOST("ClusterLauncher: check_cluster_dims() failed. Aborting.");
@@ -136,14 +153,19 @@ struct ClusterLauncher {
     launch_config.dynamicSmemBytes = smem_size;
     launch_config.stream = cuda_stream;
 
-    cudaLaunchAttribute launch_attribute[1];
+    cudaLaunchAttribute launch_attribute[2];
+
     launch_attribute[0].id = cudaLaunchAttributeClusterDimension;
     launch_attribute[0].val.clusterDim.x = cluster_dims.x;
     launch_attribute[0].val.clusterDim.y = cluster_dims.y;
     launch_attribute[0].val.clusterDim.z = cluster_dims.z;
 
+    launch_attribute[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    launch_attribute[1].val.programmaticStreamSerializationAllowed = 1;
+
+    launch_config.numAttrs = launch_with_pdl ? 2 : 1;
+
     launch_config.attrs = launch_attribute;
-    launch_config.numAttrs = 1;
 
     CUTLASS_TRACE_HOST("ClusterLauncher: Launching GPC_CLUSTER_GRID GridDims = "
         "(" << grid_dims.x << ", " << grid_dims.y << ", " << grid_dims.z << "), "
@@ -157,6 +179,7 @@ struct ClusterLauncher {
     return Status::kInvalid;
 #endif
   }
+
 };
 
 namespace detail {
@@ -212,7 +235,7 @@ struct ClusterLaunchParams {
 /// void const* kernel_ptr =
 ///   const_cast<void const*>(reinterpret_cast<void*>(
 ///     &kernel<SharedMemory, X, Y, Z>));
-/// auto status = launch_on_cluster(
+/// auto status = launch_kernel_on_cluster(
 ///   {grid_dims, block_dims, cluster_dims, sizeof(SharedMemory)},
 ///   kernel_ptr, x, y, z);
 /// @endcode
@@ -226,8 +249,11 @@ launch_kernel_on_cluster(const ClusterLaunchParams& params,
   // the parameters as an array of raw pointers.
   if constexpr (sizeof...(Args) == 0) {
     return cutlass::ClusterLauncher::launch(
-      params.grid_dims, params.cluster_dims, params.block_dims,
-      params.smem_size_in_bytes, params.cuda_stream,
+      params.grid_dims,
+      params.cluster_dims,
+      params.block_dims,
+      params.smem_size_in_bytes,
+      params.cuda_stream,
       kernel_ptr, nullptr);
   }
   else {
@@ -235,9 +261,13 @@ launch_kernel_on_cluster(const ClusterLaunchParams& params,
       detail::checked_addressof(std::forward<Args>(args))...
     };
     return cutlass::ClusterLauncher::launch(
-      params.grid_dims, params.cluster_dims, params.block_dims,
-      params.smem_size_in_bytes, params.cuda_stream,
-      kernel_ptr, kernel_params);
+      params.grid_dims,
+      params.cluster_dims,
+      params.block_dims,
+      params.smem_size_in_bytes,
+      params.cuda_stream,
+      kernel_ptr,
+      kernel_params);
   }
 }
 

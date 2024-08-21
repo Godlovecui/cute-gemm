@@ -30,14 +30,32 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cute/config.hpp>
+namespace cutlass::gemm::kernel {
 
-#include <vector_types.h>
-#include <cutlass/numeric_types.h>
 
-namespace cute {
+/*
+ * Stateless universal device GEMM kernel type that treats GEMM as
+ * a composition of a collective mainloop and a collective epilogue.
+ *
+ * Supports both the 2.x and 3.x APIs based on whether the first type is
+ * a cute::tuple<> or not.
+ * 2.x API implementation: cutlass/gemm/kernel/gemm_universal.h
+ * 3.x API implementation: cutlass/gemm/kernel/gemm_*.hpp
+ *
+ * In the following declaration, the name preceding the 'Or' refers to
+ * 3.x API type argument order, and the name succeeding the 'Or' refers to
+ * 2.x API type argument order. Template arguments without two names
+ * belong to the 3.x API only.
+**/
+template <
+  class ProblemShapeOrThreadblockMma_, // (m, n, k) or (m, n, k, l)
+  class CollectiveMainloopOrEpilogue_,
+  class CollectiveEpilogueOrThreadblockSwizzle_,
+  class TileScheduler_ = void,
+  class Enable = void
+>
+class GemmUniversal;
 
-using cutlass::float_e4m3_t;
-using cutlass::float_e5m2_t;
 
-} // end namespace cute
+} // namespace cutlass::gemm::kernel
+

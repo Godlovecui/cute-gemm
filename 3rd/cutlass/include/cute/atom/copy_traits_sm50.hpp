@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2024 - 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,24 +30,29 @@
  **************************************************************************************************/
 #pragma once
 
-#include <cute/config.hpp>
+#include <cute/arch/copy_sm50.hpp>
+#include <cute/atom/copy_traits.hpp>
 
-#include <vector_types.h>
-#include <cutlass/numeric_types.h>
+#include <cute/layout.hpp>
 
-namespace cute {
-
-using cutlass::bfloat16_t;
-
-//
-// Display utilities
-//
-
-#if !defined(__CUDACC_RTC__)
-CUTE_HOST std::ostream& operator<<(std::ostream& os, bfloat16_t const& v)
+namespace cute
 {
-  return os << float(v);
-}
-#endif
+
+template <>
+struct Copy_Traits<SM50_Shuffle_U32_2x2Trans>
+{
+  // Logical thread id to thread idx (one-thread)
+  using ThrID = Layout<_32>;
+
+  // Map from (src-thr,src-val) to bit
+  using SrcLayout = Layout<Shape <_32,_64>,
+                           Stride<_64, _1>>;
+  // Map from (dst-thr,dst-val) to bit
+  using DstLayout = Layout<Shape <Shape < _2,  _16>,Shape <_32,  _2>>,
+                           Stride<Stride<_32, _128>,Stride< _1, _64>>>;
+
+  // Reference map from (thr,val) to bit
+  using RefLayout = SrcLayout;
+};
 
 } // end namespace cute

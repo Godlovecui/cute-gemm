@@ -40,6 +40,7 @@
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler.hpp"
+#include "cutlass/gemm/kernel/gemm_universal_decl.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/trace.h"
 
@@ -70,7 +71,6 @@ public:
   using ProblemShape = ProblemShape_;
   static_assert(cute::rank(ProblemShape{}) == 3 or cute::rank(ProblemShape{}) == 4,
     "ProblemShape{} should be <M,N,K> or <M,N,K,L>");
-
   // Mainloop derived types
   using CollectiveMainloop = CollectiveMainloop_;
   using TileShape = typename CollectiveMainloop::TileShape;
@@ -156,12 +156,12 @@ public:
 
   // Kernel entry point API
   struct Params {
-    GemmUniversalMode mode;
-    ProblemShape problem_shape;
-    MainloopParams mainloop;
-    EpilogueParams epilogue;
-    KernelHardwareInfo hw_info;
-    TileSchedulerParams scheduler;
+    GemmUniversalMode mode{};
+    ProblemShape problem_shape{};
+    MainloopParams mainloop{};
+    EpilogueParams epilogue{};
+    KernelHardwareInfo hw_info{};
+    TileSchedulerParams scheduler{};
   };
 
   //
@@ -176,7 +176,7 @@ public:
 
     (void) workspace;
     auto problem_shape = args.problem_shape;
-    if constexpr (detail::IF_SWAP_AB<CollectiveMainloop>::value) {
+    if constexpr (detail::Has_SwapAB_v<CollectiveMainloop>) {
       // swap M/N
       get<0>(problem_shape) = get<1>(args.problem_shape);
       get<1>(problem_shape) = get<0>(args.problem_shape);
@@ -207,8 +207,7 @@ public:
     };
   }
 
-  CUTLASS_HOST_DEVICE static
-  bool
+  static bool
   can_implement(Arguments const& args) {
     bool implementable = (args.mode == GemmUniversalMode::kGemm) or
         (args.mode == GemmUniversalMode::kBatched && cute::rank(ProblemShape{}) == 4);
@@ -224,14 +223,15 @@ public:
   }
 
   static
-  int
+  size_t
   get_workspace_size(Arguments const& args) {
     return 0;
   }
 
   static
   cutlass::Status
-  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr) {
+  initialize_workspace(Arguments const& args, void* workspace = nullptr, cudaStream_t stream = nullptr,
+    CudaHostAdapter* cuda_adapter = nullptr) {
     return Status::kSuccess;
   }
 
@@ -367,7 +367,7 @@ public:
       epi_load_pipe_consumer_state.advance(c_tile_count);
       epi_store_pipe_producer_state.advance(d_tile_count);
     }
-    auto work_tile_info = scheduler.get_current_work();
+    auto work_tile_info = scheduler.initial_work_tile_info(ClusterShape{});
 
     // In a warp specialized kernel, collectives expose data movement and compute operations separately
     CollectiveMainloop collective_mainloop;

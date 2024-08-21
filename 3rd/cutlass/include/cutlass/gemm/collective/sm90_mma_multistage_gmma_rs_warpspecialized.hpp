@@ -31,18 +31,19 @@
 #pragma once
 
 #include "cutlass/cutlass.h"
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/numeric_types.h"
+#include "cutlass/pipeline/pipeline.hpp"
+#include "cutlass/transform/collective/sm90_wgmma_transpose.hpp"
+#include "cutlass/trace.h"
+
 #include "cute/arch/cluster_sm90.hpp"
 #include "cute/arch/copy_sm90.hpp"
-#include "cutlass/gemm/dispatch_policy.hpp"
-
 #include "cute/algorithm/functional.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/tensor_predicate.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
-#include "cutlass/pipeline/pipeline.hpp"
-#include "cutlass/transform/collective/sm90_wgmma_transpose.hpp"
-#include "cutlass/trace.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -106,6 +107,7 @@ struct CollectiveMma<
   using SmemCopyAtomA = SmemCopyAtomA_;
   using SmemCopyAtomB = SmemCopyAtomB_;
 
+  using CtaShape_MNK = decltype(shape_div(TileShape{}, ClusterShape{}));
   // Swap and transpose A/B for A k-major layout and B mn-major layout since WGMMA is k-major only (e.g. tf32, Fp32, Int8, Fp8 WGMMA)
   static constexpr bool IsLayoutAkBmn =
     cute::is_same_v<gemm::detail::StrideToLayoutTagA_t<StrideA>, layout::RowMajor> &&
@@ -178,7 +180,7 @@ struct CollectiveMma<
   static_assert(!SwapAB || !TransposeB, "Cannot SwapAB and TransposeB at the same time.");
   static_assert(TransposeB xor (cute::is_same_v<SmemLayoutB, GmmaSmemLayoutB>),
     "Should be same layout if not TransposeB.");
-  static_assert(!TransposeB || ((size<1>(SmemLayoutB{}) * sizeof_bits<InternalElementB>::value) / 8) == 128,
+  static_assert(!TransposeB || (cutlass::bits_to_bytes(size<1>(SmemLayoutB{}) * sizeof_bits<InternalElementB>::value)) == 128,
     "SmemLayoutB K must be 128bytes to be transposed.");
   static_assert(!transform::collective::detail::use_universal_transposition<InternalSmemLayoutAtomB, InternalElementB>(),
     "Warp specialized ARF kernels have not supported universal B transposition yet.");
@@ -243,7 +245,7 @@ struct CollectiveMma<
   }
 
   template<class ProblemShape>
-  CUTLASS_HOST_DEVICE static bool
+  static bool
   can_implement(
       ProblemShape const& problem_shape,
       [[maybe_unused]] Arguments const& args) {
@@ -443,14 +445,27 @@ struct CollectiveMma<
     // Define C accumulators and A/B partitioning
     //
 
+    // Layout of warp group to thread mapping
+
+    static_assert(stride<0>(typename TiledMma::BLayout{}) == 0 and
+                  size<0>(typename TiledMma::BLayout{}) == NumThreadsPerWarpGroup, 
+                  "Stride of the first mode must be 0 and the size of the mode must be NumThreadsPerWarpGroup");
+
+    constexpr int MmaWarpGroups = size(TiledMma{}) / NumThreadsPerWarpGroup;
+    Layout warp_group_thread_layout = make_layout(Int<MmaWarpGroups>{}, 
+                                                  Int<NumThreadsPerWarpGroup>{});
+
+    int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / NumThreadsPerWarpGroup, 0);
+
     TiledMma tiled_mma;
-    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    auto mma_thread_slice = tiled_mma.get_thread_slice(thread_idx);
+    auto mma_warpgroup_slice = tiled_mma.get_slice(warp_group_thread_layout(warp_group_idx));
 
     // Allocate fragments and descriptors
-    Tensor tCsA = thread_mma.partition_A(sA);
-    Tensor tCrA = thread_mma.partition_fragment_A(sA(_,_,Int<0>{}));                          // (MMA,MMA_M,MMA_K,PIPE)
-    Tensor tCsB = thread_mma.partition_B(gmma_sB);                                            // (MMA,MMA_N,MMA_K,PIPE)
-    Tensor tCrB = thread_mma.make_fragment_B(tCsB);                                           // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tCsA = mma_thread_slice.partition_A(sA);
+    Tensor tCrA = mma_thread_slice.partition_fragment_A(sA(_,_,Int<0>{}));                    // (MMA,MMA_M,MMA_K,PIPE)
+    Tensor tCsB = mma_warpgroup_slice.partition_B(gmma_sB);                                   // (MMA,MMA_N,MMA_K,PIPE)
+    Tensor tCrB = mma_warpgroup_slice.make_fragment_B(tCsB);                                  // (MMA,MMA_N,MMA_K,PIPE)
 
     //
     // Copy Atom A retiling

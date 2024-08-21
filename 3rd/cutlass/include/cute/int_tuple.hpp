@@ -218,7 +218,7 @@ static constexpr int depth_v = depth_t<Tuple>::value;
 // product
 //
 
-// Implementation of product (see below) as a function object
+// Implementation of product as a function object
 struct Product
 {
   template <class IntTuple>
@@ -232,7 +232,7 @@ struct Product
       } else {
         return cute::transform_apply(a, Product{}, multiplies_unary_lfold{});
       }
-    } else {
+    } else if constexpr (cute::is_integral<IntTuple>::value) {
       return a;
     }
 
@@ -248,7 +248,7 @@ CUTE_HOST_DEVICE constexpr
 auto
 product_each(Tuple const& t)
 {
-  return transform(wrap(t), [](auto const& x) { return product(x); });
+  return transform(wrap(t), product);
 }
 
 // Take the product of Tuple at the leaves of TupleG
@@ -325,10 +325,21 @@ CUTE_HOST_DEVICE constexpr
 auto
 ceil_div(IntTupleA const& a, IntTupleB const& b)
 {
-  if constexpr (is_tuple<IntTupleA>::value && is_tuple<IntTupleB>::value) {
-    static_assert(tuple_size<IntTupleA>::value >= tuple_size<IntTupleB>::value, "Mismatched ranks");
-    constexpr int R = tuple_size<IntTupleA>::value;        // Missing ranks in TupleB are implicitly 1
-    return transform(a, append<R>(b,Int<1>{}), [](auto const& x, auto const& y) { return ceil_div(x,y); });
+  if constexpr (is_tuple<IntTupleA>::value) {
+    if constexpr (is_tuple<IntTupleB>::value) {  // tuple tuple
+      static_assert(tuple_size<IntTupleA>::value >= tuple_size<IntTupleB>::value, "Mismatched ranks");
+      constexpr int R = tuple_size<IntTupleA>::value;        // Missing ranks in TupleB are implicitly 1
+      return transform(a, append<R>(b,Int<1>{}), [](auto const& x, auto const& y) { return ceil_div(x,y); });
+    } else {                                     // tuple int
+      auto const [result, rest] = fold(a, cute::make_tuple(cute::make_tuple(), b),
+        [] (auto const& init, auto const& ai) {
+          return cute::make_tuple(append(get<0>(init), ceil_div(ai, get<1>(init))), ceil_div(get<1>(init), ai));
+        });
+      return result;
+    }
+  } else
+  if constexpr (is_tuple<IntTupleB>::value) {    // int tuple
+    return ceil_div(a, product(b));
   } else {
     return (a + b - Int<1>{}) / b;
   }
@@ -394,7 +405,7 @@ shape_div(IntTupleA const& a, IntTupleB const& b)
     static_assert(IntTupleA::value % IntTupleB::value == 0 || IntTupleB::value % IntTupleA::value == 0, "Static shape_div failure");
     return C<shape_div(IntTupleA::value, IntTupleB::value)>{};
   } else {                                       // int int
-    //assert(a % b == 0 || b % a == 0);          // Wave dynamic assertion
+    //assert(a % b == 0 || b % a == 0);          // Waive dynamic assertion
     return a / b != 0 ? a / b : signum(a) * signum(b);  // Division with rounding away from zero
   }
 
@@ -482,6 +493,7 @@ using is_weakly_congruent = decltype(weakly_congruent(declval<A>(), declval<B>()
 /** Test if Shape A is compatible with Shape B:
  *    the size of A and B are the same, and
  *    any coordinate into A can also be used as a coordinate into B
+ * Equivalently, the size of Shape B is the same as Shape A at each terminal of Shape A.
  * compatible is a partial order on A and B: A <= B
  */
 template <class IntTupleA, class IntTupleB>
@@ -512,6 +524,7 @@ using is_compatible = decltype(compatible(declval<A>(), declval<B>()));
 
 /** Test if Shape A is weakly compatible with Shape B:
  *    there exists a Shape C congruent to A such that compatible(elem_scale(A,C), B)
+ * Equivalently, the size of Shape B is a multiple of Shape A at each terminal of Shape A.
  * weakly_compatible is a partial order on A and B: A <= B
  */
 template <class IntTupleA, class IntTupleB>
@@ -539,6 +552,37 @@ weakly_compatible(IntTupleA const& a, IntTupleB const& b)
 
 template <class A, class B>
 using is_weakly_compatible = decltype(weakly_compatible(declval<A>(), declval<B>()));
+
+/** Test if Shape A is softly compatible with Shape B:
+ *    there exists a Shape C congruent to A such that compatible(shape_div(A,C), B)
+ * Equivalently, the size of Shape B divides Shape A at each terminal of Shape A.
+ * softly_compatible is a partial order on A and B: A <= B
+ */
+template <class IntTupleA, class IntTupleB>
+CUTE_HOST_DEVICE constexpr
+auto
+softly_compatible(IntTupleA const& a, IntTupleB const& b)
+{
+  if constexpr (is_tuple<IntTupleA>::value && is_tuple<IntTupleB>::value) {
+    if constexpr (tuple_size<IntTupleA>::value != tuple_size<IntTupleB>::value) {
+      return false_type{};
+    } else {
+      return transform_apply(a, b, [](auto const& x, auto const& y) { return softly_compatible(x,y); },
+                                   [](auto const&... z) { return (true_type{} && ... && z); });
+    }
+  } else if constexpr (is_integral<IntTupleA>::value) {
+    return a % size(b) == Int<0>{};
+  } else if constexpr (is_integral<IntTupleB>::value) {
+    return false_type{};
+  } else {
+    return softly_compatible(shape(a), shape(b));
+  }
+
+  CUTE_GCC_UNREACHABLE;
+}
+
+template <class A, class B>
+using is_softly_compatible = decltype(softly_compatible(declval<A>(), declval<B>()));
 
 /** Replace the elements of Tuple B that are paired with an Int<0> with an Int<1>
  */
@@ -855,7 +899,10 @@ elem_geq(T const& t, U const& u) {
   return !elem_less(t, u);
 }
 
+namespace detail {
+
 /** Increment a (dynamic) coord lexicographically within a shape
+ * @pre is_congruent<Coord,Shape>::value
  * \code
  *    auto shape = make_shape(1,2,make_shape(2,3),3);
  *
@@ -866,43 +913,25 @@ elem_geq(T const& t, U const& u) {
  *   assert(i == size(shape));
  * \endcode
  */
-template <class Coord, class Shape>
+template <int I = 0, class Coord, class Shape>
 CUTE_HOST_DEVICE constexpr
 void
-increment(Coord& coord, Shape const& shape);
-
-namespace detail {
-
-template <class Coord, class Shape, int I0, int... Is>
-CUTE_HOST_DEVICE constexpr
-void
-increment(Coord& coord, Shape const& shape, seq<I0,Is...>)
+increment(Coord& coord, Shape const& shape)
 {
-  cute::increment(get<I0>(coord), get<I0>(shape));
-  if constexpr (sizeof...(Is) != 0) {
-    if (back(get<I0>(coord)) == back(get<I0>(shape))) {
-      back(get<I0>(coord)) = 0;
-      increment(coord, shape, seq<Is...>{});
+  if constexpr (is_integral<Coord>::value) {
+    ++coord;
+  } else {
+    increment(get<I>(coord), get<I>(shape));
+    if constexpr (I+1 < tuple_size<Coord>::value) {
+      if (back(get<I>(coord)) == back(get<I>(shape))) {
+        back(get<I>(coord)) = 0;
+        increment<I+1>(coord, shape);
+      }
     }
   }
 }
 
 } // end namespace detail
-
-template <class Coord, class Shape>
-CUTE_HOST_DEVICE constexpr
-void
-increment(Coord& coord, Shape const& shape)
-{
-  if constexpr (is_integral<Coord>::value && is_integral<Shape>::value) {
-    ++coord;
-  } else if constexpr (is_tuple<Coord>::value && is_tuple<Shape>::value) {
-    static_assert(tuple_size<Coord>::value == tuple_size<Shape>::value, "Mismatched ranks");
-    detail::increment(coord, shape, tuple_seq<Coord>{});
-  } else {
-    static_assert(sizeof(Coord) == 0, "Invalid parameters");
-  }
-}
 
 struct ForwardCoordIteratorSentinal
 {};
@@ -918,7 +947,7 @@ struct ForwardCoordIterator
   Coord const& operator*() const { return coord; }
 
   CUTE_HOST_DEVICE constexpr
-  ForwardCoordIterator& operator++() { increment(coord, shape); return *this; }
+  ForwardCoordIterator& operator++() { detail::increment(coord, shape); return *this; }
 
   // Sentinel for the end of the implied range
   CUTE_HOST_DEVICE constexpr
